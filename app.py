@@ -24,7 +24,7 @@ def load_data(file_train, file_verify, col_res, col_day):
 def find_optimal_truncation(data_array, max_cut_percent=0.10, steps=10):
     """Tìm khoảng cắt tối ưu (Auto Mode)"""
     calc_data = data_array
-    if len(data_array) >  40000:
+    if len(data_array) > 40000:
         np.random.seed(42)
         calc_data = np.random.choice(data_array, 40000, replace=False)
         
@@ -83,6 +83,16 @@ class PBRTQCEngine:
             self.day_indices[day] = (current_idx, current_idx + count)
             current_idx += count
 
+    def get_data_stats(self):
+        """Trả về thống kê cơ bản của dữ liệu sạch"""
+        return {
+            "Train Mean": np.mean(self.train_clean),
+            "Train Median": np.median(self.train_clean),
+            "Verify Mean": np.mean(self.global_vals),
+            "Verify Median": np.median(self.global_vals),
+            "Truncation Range": f"[{self.trunc_min:.2f} - {self.trunc_max:.2f}]"
+        }
+
     def calculate_ma(self, values, method, block_size):
         """Tính MA liên tục"""
         series = pd.Series(values)
@@ -115,7 +125,7 @@ class PBRTQCEngine:
         upper = np.percentile(valid_ma_values, (1 - target_fpr/2)*100)
         return lower, upper
 
-    def run_simulation(self, method, block_size, frequency, lcl, ucl, bias_pct, direction='positive', num_sims=None, fixed_inject_idx=None):
+    def run_simulation(self, method, block_size, frequency, lcl, ucl, bias_pct, direction='positive', fixed_inject_idx=None):
         """
         direction: 'positive' (Cộng Bias, check > UCL) hoặc 'negative' (Trừ Bias, check < LCL)
         """
@@ -141,8 +151,7 @@ class PBRTQCEngine:
         injection_flags = np.zeros(len(self.global_vals), dtype=int)
 
         days_to_run = list(self.day_indices.keys())
-        if num_sims and num_sims < len(days_to_run):
-            days_to_run = days_to_run[:num_sims]
+        # [THAY ĐỔI]: Bỏ giới hạn num_sims, chạy hết các ngày
 
         for day_name in days_to_run:
             start_idx, end_idx = self.day_indices[day_name]
@@ -190,7 +199,6 @@ class PBRTQCEngine:
                 num_fp = np.sum(alarms)
                 total_false_alarms += num_fp
                 
-                # [THAY ĐỔI THEO YÊU CẦU]: Không dùng continue nữa.
                 # Vẫn đếm FPR, nhưng vẫn chạy tiếp xuống phần Detection.
 
             # ----------------------------------------------------
@@ -268,7 +276,7 @@ st.markdown("""
 Hệ thống mô phỏng 2 chiều:
 1.  **Positive Bias (+):** Cộng thêm Bias -> Kiểm tra xem có vượt **> UCL**.
 2.  **Negative Bias (-):** Trừ đi Bias -> Kiểm tra xem có vượt **< LCL**.
-*Lưu ý: FPR không dừng quy trình kiểm tra Detection.*
+*Lưu ý: FPR không dừng quy trình kiểm tra Detection. Hệ thống chạy trên toàn bộ dữ liệu ngày.*
 """)
 
 with st.sidebar:
@@ -279,9 +287,10 @@ with st.sidebar:
     st.divider()
     st.header("2. Settings")
     bias_pct = st.number_input("Bias (%)", value=5.0, step=0.5, help="Giá trị % dùng để cộng (Pos) và trừ (Neg).")
-    target_fpr = st.slider("Target FPR (%)", 0.1, 10.0, 2.0, 0.1) / 100
+    # [THAY ĐỔI]: Target FPR từ 0.0 đến 10.0
+    target_fpr = st.slider("Target FPR (%)", 0.0, 10.0, 2.0, 0.1) / 100
     model = st.selectbox("Model", ["EWMA", "SMA"])
-    max_days = st.slider("Max Simulation Days", 10, 5000, 100)
+    # [THAY ĐỔI]: Bỏ Max Simulation Days
     
     st.subheader("Injection Mode")
     inject_mode = st.radio("Chế độ thêm lỗi:", ["Ngẫu nhiên (Random 1-40)", "Cố định (Fixed Point)"])
@@ -312,22 +321,29 @@ if f_train and f_verify:
     st.divider()
     st.subheader(f"4. Cấu hình tham số cho {model}")
     
+    # [THAY ĐỔI]: Cấu hình mặc định dựa trên Model
+    default_configs = []
+    if model == 'SMA':
+        default_configs = [(20, 2), (30, 3), (40, 4)]
+    else: # EWMA
+        default_configs = [(3, 3), (4, 4), (5, 5)]
+
     col_case1, col_case2, col_case3 = st.columns(3)
     cases_config = []
     
-    def create_case_input(col, idx):
+    def create_case_input(col, idx, default_n, default_f):
         with col:
             st.markdown(f"**Case {idx}**")
-            bs = st.number_input(f"Block Size (N)", value=20*idx, key=f"bs{idx}", min_value=2)
-            freq = st.number_input("Frequency (F)", value=1, key=f"freq{idx}", min_value=1)
+            bs = st.number_input(f"Block Size (N)", value=default_n, key=f"bs{idx}", min_value=2)
+            freq = st.number_input("Frequency (F)", value=default_f, key=f"freq{idx}", min_value=1)
             return {'bs': bs, 'freq': freq}
 
-    cases_config.append(create_case_input(col_case1, 1))
-    cases_config.append(create_case_input(col_case2, 2))
-    cases_config.append(create_case_input(col_case3, 3))
+    cases_config.append(create_case_input(col_case1, 1, default_configs[0][0], default_configs[0][1]))
+    cases_config.append(create_case_input(col_case2, 2, default_configs[1][0], default_configs[1][1]))
+    cases_config.append(create_case_input(col_case3, 3, default_configs[2][0], default_configs[2][1]))
 
     if st.button("🚀 Run Dual Simulation"):
-        with st.spinner("Đang chạy mô phỏng 2 chiều..."):
+        with st.spinner("Đang chạy mô phỏng 2 chiều trên toàn bộ dữ liệu..."):
             df_train, df_verify = load_data(f_train, f_verify, col_res, col_day)
             
             if df_train is not None:
@@ -342,6 +358,11 @@ if f_train and f_verify:
                 
                 engine = PBRTQCEngine(df_train, df_verify, col_res, col_day, trunc_range)
                 
+                # [THAY ĐỔI]: Hiển thị thống kê dữ liệu sau khi Truncation
+                st.subheader("📋 Thống kê Dữ liệu (Sau Truncation)")
+                stats_data = engine.get_data_stats()
+                st.dataframe(pd.DataFrame([stats_data]), use_container_width=True)
+
                 results_pos = []
                 results_neg = []
                 excel_sheets = {} 
@@ -358,7 +379,7 @@ if f_train and f_verify:
                         method=model, block_size=case['bs'], frequency=case['freq'],
                         lcl=lcl, ucl=ucl, bias_pct=bias_pct,
                         direction='positive', # <--- Hướng dương
-                        num_sims=max_days, fixed_inject_idx=fixed_point
+                        fixed_inject_idx=fixed_point
                     )
                     
                     # 2. Chạy Negative Bias
@@ -366,7 +387,7 @@ if f_train and f_verify:
                         method=model, block_size=case['bs'], frequency=case['freq'],
                         lcl=lcl, ucl=ucl, bias_pct=bias_pct,
                         direction='negative', # <--- Hướng âm
-                        num_sims=max_days, fixed_inject_idx=fixed_point
+                        fixed_inject_idx=fixed_point
                     )
                     
                     # Lưu kết quả
@@ -405,6 +426,3 @@ if f_train and f_verify:
                 )
             else:
                 st.error("Lỗi dữ liệu.")
-
-
-
