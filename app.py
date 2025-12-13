@@ -24,7 +24,7 @@ def load_data(file_train, file_verify, col_res, col_day):
 def find_optimal_truncation(data_array, max_cut_percent=0.10, steps=10):
     """Tìm khoảng cắt tối ưu (Auto Mode)"""
     calc_data = data_array
-    if len(data_array) > 5000:
+    if len(data_array) >  20000:
         np.random.seed(42)
         calc_data = np.random.choice(data_array, 5000, replace=False)
         
@@ -405,3 +405,4 @@ if f_train and f_verify:
                 )
             else:
                 st.error("Lỗi dữ liệu.")
+
