@@ -52,7 +52,7 @@ def find_optimal_truncation(data_array, max_cut_percent=0.10, steps=10):
     return best_range
 
 # =========================================================
-# 🧠 PHẦN 2: ENGINE MÔ PHỎNG (STRIDE LOGIC & NPED CALC)
+# 🧠 PHẦN 2: ENGINE MÔ PHỎNG (DUAL DIRECTION)
 # =========================================================
 
 class PBRTQCEngine:
@@ -94,7 +94,7 @@ class PBRTQCEngine:
         return values
 
     def get_report_mask(self, total_length, block_size, frequency):
-        """Tạo mask xác định các điểm Report (N, N+F, N+2F...)"""
+        """Tạo mask xác định các điểm Report"""
         mask = np.zeros(total_length, dtype=bool)
         start_idx = int(block_size) - 1
         if start_idx < total_length:
@@ -103,7 +103,7 @@ class PBRTQCEngine:
         return mask
 
     def determine_limits(self, method, block_size, frequency, target_fpr):
-        """Tính Limit dựa trên các điểm Report của Training Data"""
+        """Tính Limit"""
         ma_values = self.calculate_ma(self.train_clean, method, block_size)
         mask = self.get_report_mask(len(ma_values), block_size, frequency)
         valid_ma_values = ma_values[mask]
@@ -115,7 +115,10 @@ class PBRTQCEngine:
         upper = np.percentile(valid_ma_values, (1 - target_fpr/2)*100)
         return lower, upper
 
-    def run_simulation(self, method, block_size, frequency, lcl, ucl, bias_pct, num_sims=None, fixed_inject_idx=None):
+    def run_simulation(self, method, block_size, frequency, lcl, ucl, bias_pct, direction='positive', num_sims=None, fixed_inject_idx=None):
+        """
+        direction: 'positive' (Cộng Bias, check > UCL) hoặc 'negative' (Trừ Bias, check < LCL)
+        """
         total_days = 0
         detected_days = 0
         nped_list = []
@@ -123,7 +126,11 @@ class PBRTQCEngine:
         total_clean_checks = 0    
         total_false_alarms = 0    
 
-        bias_factor = 1 + (bias_pct / 100.0)
+        # Xử lý Bias Factor dựa trên hướng
+        if direction == 'positive':
+            bias_factor = 1 + (bias_pct / 100.0)
+        else: # negative
+            bias_factor = 1 - (bias_pct / 100.0)
         
         # 1. Tính Clean MA & Report Mask
         global_ma_clean = self.calculate_ma(self.global_vals, method, block_size)
@@ -141,31 +148,25 @@ class PBRTQCEngine:
             start_idx, end_idx = self.day_indices[day_name]
             day_len = end_idx - start_idx
             
-            # --- LOGIC MỚI: LỌC NGÀY ---
-            # 1. Nếu là ngày đầu tiên của toàn bộ dữ liệu (start_idx = 0):
-            # Bắt buộc phải đủ Block Size để khởi tạo MA.
+            # Logic lọc ngày: Ngày đầu tiên phải đủ Block. Các ngày sau chỉ cần đủ để chứa Injection Point.
             if start_idx == 0 and day_len < block_size:
                 continue
 
-            # 2. Xác định điểm tiêm lỗi (Injection Point)
+            # Xác định Injection Point
             if fixed_inject_idx is not None:
                 local_inject = fixed_inject_idx
-                # Nếu ngày quá ngắn, không tới được điểm Fixed Injection -> Bỏ qua
-                if day_len <= local_inject:
-                    continue
+                if day_len <= local_inject: continue
             else:
-                # Random Logic: Tự động điều chỉnh theo độ dài ngày
-                # Đảm bảo còn ít nhất 1 mẫu sau điểm tiêm lỗi
-                if day_len < 3: continue # Quá ngắn để random
+                if day_len < 3: continue
                 max_rnd = day_len - 2 
                 if max_rnd < 1: max_rnd = 1
                 local_inject = np.random.randint(1, max_rnd + 1)
             
-            # --- CHẠY MÔ PHỎNG NẾU ĐỦ ĐIỀU KIỆN ---
+            # Đủ điều kiện chạy
             total_days += 1
             global_inject_idx = start_idx + local_inject
             
-            # Cập nhật Data Export
+            # Export data update
             global_biased_export[global_inject_idx : end_idx] *= bias_factor
             injection_flags[global_inject_idx : end_idx] = 1
 
@@ -174,18 +175,23 @@ class PBRTQCEngine:
             # ----------------------------------------------------
             clean_check_mask = np.zeros(len(self.global_vals), dtype=bool)
             clean_check_mask[start_idx : global_inject_idx] = True
-            
             final_clean_mask = clean_check_mask & global_report_mask
             check_vals = global_ma_clean[final_clean_mask]
             
             if len(check_vals) > 0:
                 total_clean_checks += len(check_vals)
-                alarms = (check_vals < lcl) | (check_vals > ucl)
+                
+                # Check 1 chiều tùy theo hướng
+                if direction == 'positive':
+                    alarms = (check_vals > ucl) # Chỉ check vượt trên
+                else:
+                    alarms = (check_vals < lcl) # Chỉ check vượt dưới
+                
                 num_fp = np.sum(alarms)
                 total_false_alarms += num_fp
                 
-                if num_fp > 0:
-                    continue # False Alarm Day -> Skip
+                # [THAY ĐỔI THEO YÊU CẦU]: Không dùng continue nữa.
+                # Vẫn đếm FPR, nhưng vẫn chạy tiếp xuống phần Detection.
 
             # ----------------------------------------------------
             # 2. CHECK DETECTION (Vùng sau lỗi)
@@ -193,6 +199,7 @@ class PBRTQCEngine:
             temp_global_vals = self.global_vals.copy()
             temp_global_vals[global_inject_idx : end_idx] *= bias_factor
             
+            # Tính lại MA
             global_ma_biased = self.calculate_ma(temp_global_vals, method, block_size)
             
             biased_check_mask = np.zeros(len(self.global_vals), dtype=bool)
@@ -202,7 +209,11 @@ class PBRTQCEngine:
             check_vals_post = global_ma_biased[final_biased_mask]
             
             if len(check_vals_post) > 0:
-                alarms_post = (check_vals_post < lcl) | (check_vals_post > ucl)
+                # Check 1 chiều tùy theo hướng
+                if direction == 'positive':
+                    alarms_post = (check_vals_post > ucl)
+                else:
+                    alarms_post = (check_vals_post < lcl)
                 
                 if np.any(alarms_post):
                     detected_days += 1
@@ -228,7 +239,7 @@ class PBRTQCEngine:
             "95NPed": round(np.percentile(nped_list, 95), 1) if nped_list else "N/A"
         }
         
-        # --- EXCEL EXPORT ---
+        # --- EXPORT DATA ---
         global_ma_biased_export = self.calculate_ma(global_biased_export, method, block_size)
         aon_results = np.full(len(global_ma_biased_export), np.nan)
         aon_results[global_report_mask] = global_ma_biased_export[global_report_mask]
@@ -252,11 +263,12 @@ class PBRTQCEngine:
 
 st.set_page_config(layout="wide", page_title="PBRTQC Simulator Pro")
 
-st.title("🏥 PBRTQC Simulator: Stride Logic")
+st.title("🏥 PBRTQC Simulator: Dual Bias Check")
 st.markdown("""
-**Hệ thống tính toán:**
-- **Continuous Logic:** Ngày sau nối tiếp ngày trước.
-- **Filter Logic:** Chỉ loại bỏ ngày quá ngắn so với điểm tiêm lỗi. Ngày đầu tiên bắt buộc >= Block Size.
+Hệ thống mô phỏng 2 chiều:
+1.  **Positive Bias (+):** Cộng thêm Bias -> Kiểm tra xem có vượt **> UCL**.
+2.  **Negative Bias (-):** Trừ đi Bias -> Kiểm tra xem có vượt **< LCL**.
+*Lưu ý: FPR không dừng quy trình kiểm tra Detection.*
 """)
 
 with st.sidebar:
@@ -266,7 +278,7 @@ with st.sidebar:
     
     st.divider()
     st.header("2. Settings")
-    bias_pct = st.number_input("Bias (%)", value=5.0, step=0.5)
+    bias_pct = st.number_input("Bias (%)", value=5.0, step=0.5, help="Giá trị % dùng để cộng (Pos) và trừ (Neg).")
     target_fpr = st.slider("Target FPR (%)", 0.1, 10.0, 2.0, 0.1) / 100
     model = st.selectbox("Model", ["EWMA", "SMA"])
     max_days = st.slider("Max Simulation Days", 10, 5000, 100)
@@ -306,18 +318,16 @@ if f_train and f_verify:
     def create_case_input(col, idx):
         with col:
             st.markdown(f"**Case {idx}**")
-            bs = st.number_input(f"Block Size (N)", value=20*idx, key=f"bs{idx}", min_value=2,
-                                 help="Kích thước cửa sổ tính toán (Window Size).")
-            freq = st.number_input("Frequency (F)", value=1, key=f"freq{idx}", min_value=1,
-                                 help="Bước nhảy báo cáo (Stride).")
+            bs = st.number_input(f"Block Size (N)", value=20*idx, key=f"bs{idx}", min_value=2)
+            freq = st.number_input("Frequency (F)", value=1, key=f"freq{idx}", min_value=1)
             return {'bs': bs, 'freq': freq}
 
     cases_config.append(create_case_input(col_case1, 1))
     cases_config.append(create_case_input(col_case2, 2))
     cases_config.append(create_case_input(col_case3, 3))
 
-    if st.button("🚀 Run Simulation"):
-        with st.spinner("Đang chạy mô phỏng..."):
+    if st.button("🚀 Run Dual Simulation"):
+        with st.spinner("Đang chạy mô phỏng 2 chiều..."):
             df_train, df_verify = load_data(f_train, f_verify, col_res, col_day)
             
             if df_train is not None:
@@ -332,48 +342,65 @@ if f_train and f_verify:
                 
                 engine = PBRTQCEngine(df_train, df_verify, col_res, col_day, trunc_range)
                 
-                results = []
+                results_pos = []
+                results_neg = []
                 excel_sheets = {} 
                 
                 prog_bar = st.progress(0)
                 
+                # Chạy Loop cho từng Case
                 for i, case in enumerate(cases_config):
+                    # Tính Limit chung (FPR chia đều 2 đuôi)
                     lcl, ucl = engine.determine_limits(model, case['bs'], case['freq'], target_fpr)
                     
-                    metrics, export_df = engine.run_simulation(
-                        method=model, 
-                        block_size=case['bs'], 
-                        frequency=case['freq'],
-                        lcl=lcl, ucl=ucl, 
-                        bias_pct=bias_pct,
-                        num_sims=max_days, 
-                        fixed_inject_idx=fixed_point
+                    # 1. Chạy Positive Bias
+                    metrics_pos, df_pos = engine.run_simulation(
+                        method=model, block_size=case['bs'], frequency=case['freq'],
+                        lcl=lcl, ucl=ucl, bias_pct=bias_pct,
+                        direction='positive', # <--- Hướng dương
+                        num_sims=max_days, fixed_inject_idx=fixed_point
                     )
                     
-                    res_row = {
-                        "Case": f"N={case['bs']}, F={case['freq']}",
-                        "LCL": round(lcl, 2), "UCL": round(ucl, 2),
-                        **metrics
-                    }
-                    results.append(res_row)
-                    excel_sheets[f"Case_N{case['bs']}_F{case['freq']}"] = export_df
+                    # 2. Chạy Negative Bias
+                    metrics_neg, df_neg = engine.run_simulation(
+                        method=model, block_size=case['bs'], frequency=case['freq'],
+                        lcl=lcl, ucl=ucl, bias_pct=bias_pct,
+                        direction='negative', # <--- Hướng âm
+                        num_sims=max_days, fixed_inject_idx=fixed_point
+                    )
+                    
+                    # Lưu kết quả
+                    row_base = {"Case": f"N={case['bs']}, F={case['freq']}", "LCL": round(lcl, 2), "UCL": round(ucl, 2)}
+                    results_pos.append({**row_base, **metrics_pos})
+                    results_neg.append({**row_base, **metrics_neg})
+                    
+                    # Lưu Excel (Phân biệt sheet Pos và Neg)
+                    excel_sheets[f"Pos_N{case['bs']}_F{case['freq']}"] = df_pos
+                    excel_sheets[f"Neg_N{case['bs']}_F{case['freq']}"] = df_neg
+                    
                     prog_bar.progress((i+1)/len(cases_config))
                 
-                st.subheader("📊 Bảng Kết quả Đánh giá")
-                st.dataframe(pd.DataFrame(results).style.highlight_max(subset=['Detected (%)'], color='#d1ffbd'), use_container_width=True)
-                
+                # --- HIỂN THỊ KẾT QUẢ ---
+                st.subheader("📈 Kết quả: Positive Bias Check (Check > UCL)")
+                st.dataframe(pd.DataFrame(results_pos).style.highlight_max(subset=['Detected (%)'], color='#d1ffbd'), use_container_width=True)
+
                 st.divider()
-                st.subheader("📥 Xuất dữ liệu")
+
+                st.subheader("📉 Kết quả: Negative Bias Check (Check < LCL)")
+                st.dataframe(pd.DataFrame(results_neg).style.highlight_max(subset=['Detected (%)'], color='#ffcccc'), use_container_width=True)
                 
+                # --- DOWNLOAD ---
+                st.divider()
+                st.subheader("📥 Xuất dữ liệu (Gồm cả Pos & Neg Sheets)")
                 output = io.BytesIO()
                 with pd.ExcelWriter(output, engine='openpyxl') as writer:
                     for sheet_name, df in excel_sheets.items():
                         df.to_excel(writer, sheet_name=sheet_name, index=False)
                 
                 st.download_button(
-                    label="Tải xuống chi tiết (.xlsx)",
+                    label="Tải xuống báo cáo chi tiết (.xlsx)",
                     data=output.getvalue(),
-                    file_name="PBRTQC_Simulation_Results.xlsx",
+                    file_name="PBRTQC_Dual_Simulation.xlsx",
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
                 )
             else:
