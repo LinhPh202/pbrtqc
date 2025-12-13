@@ -109,7 +109,13 @@ class PBRTQCEngine:
         
         bias_factor = 1 + (bias_pct / 100.0)
         
-        # Tính Global Clean MA (để xuất ra Excel và check FP)
+        # --- CHUẨN BỊ DỮ LIỆU ĐỂ XUẤT EXCEL ---
+        # Tạo bản sao của dữ liệu gốc để lưu giá trị Biased cho mục đích hiển thị
+        global_biased_export = self.global_vals.copy()
+        # Tạo mảng đánh dấu xem dòng nào bị tiêm lỗi
+        injection_flags = np.zeros(len(self.global_vals), dtype=int)
+        
+        # Tính Global Clean MA (để check FP)
         global_ma_clean = self.calculate_ma(self.global_vals, method, param)
         
         # Mảng Index check Frequency
@@ -136,7 +142,13 @@ class PBRTQCEngine:
                 local_inject = np.random.randint(1, max_rnd + 1)
             
             global_inject_idx = start_idx + local_inject
-            # ---------------------------
+            
+            # --- CẬP NHẬT DỮ LIỆU EXCEL (BIASED DATA) ---
+            # Lưu lại dữ liệu biased của ngày này vào mảng global export
+            # (Chỉ để xuất Excel, không dùng để tính toán simulation tiếp theo vì logic reset ngày)
+            global_biased_export[global_inject_idx : end_idx] *= bias_factor
+            injection_flags[global_inject_idx : end_idx] = 1
+            # ---------------------------------------------
 
             # 1. CHECK FALSE POSITIVE (Trên Clean Run)
             region_mask = valid_check_points[start_idx : global_inject_idx]
@@ -149,9 +161,8 @@ class PBRTQCEngine:
                     false_positive_days += 1
                     continue 
 
-            # 2. CHECK DETECTION (Tính lại MA Biased)
+            # 2. CHECK DETECTION (Tính lại MA Biased cho Simulation)
             temp_global_vals = self.global_vals.copy()
-            # Tiêm lỗi từ điểm bắt đầu đến hết ngày
             temp_global_vals[global_inject_idx : end_idx] *= bias_factor
             
             global_ma_biased = self.calculate_ma(temp_global_vals, method, param)
@@ -165,16 +176,13 @@ class PBRTQCEngine:
                 if np.any(alarms_post):
                     detected_days += 1
                     indices_in_region = np.arange(global_inject_idx, end_idx)
-                    # Tìm điểm alarm thật sự
                     full_post_region = global_ma_biased[global_inject_idx:end_idx]
                     is_alarm = (full_post_region < lcl) | (full_post_region > ucl)
-                    # Filter với frequency
                     valid_alarm_mask = is_alarm & valid_check_points[global_inject_idx:end_idx]
                     
                     if np.any(valid_alarm_mask):
-                        # Lấy index đầu tiên thỏa mãn cả 2 điều kiện
                         first_valid_alarm_rel_idx = np.argmax(valid_alarm_mask)
-                        nped = first_valid_alarm_rel_idx + 1 # +1 do tính từ điểm inject
+                        nped = first_valid_alarm_rel_idx + 1
                         nped_list.append(nped)
 
         metrics = {
@@ -186,14 +194,15 @@ class PBRTQCEngine:
             "95th NPed": round(np.percentile(nped_list, 95), 1) if nped_list else "N/A"
         }
         
-        # Trả về thêm data clean để xuất Excel
+        # --- TẠO DATAFRAME ĐỂ XUẤT EXCEL ---
         export_data = pd.DataFrame({
             'Day': self.global_days,
-            'Result': self.global_vals,
+            'Result_Original': self.global_vals,
+            'Result_Biased': global_biased_export,   # <-- Cột bạn cần
+            'Is_Injected': injection_flags,          # <-- Cột đánh dấu 0/1
             f'{method}_Clean': global_ma_clean,
             'LCL': lcl,
-            'UCL': ucl,
-            'Is_False_Alarm': ((global_ma_clean < lcl) | (global_ma_clean > ucl))
+            'UCL': ucl
         })
         
         return metrics, export_data
@@ -208,7 +217,7 @@ st.title("🏥 PBRTQC Continuous Simulator")
 st.markdown("""
 Hệ thống mô phỏng PBRTQC (Continuous Logic).
 - **EWMA:** Ẩn Frequency (mặc định check từng điểm).
-- **Export:** Tải xuống file Excel chi tiết các giá trị MA và Limit sau khi chạy.
+- **Export:** File Excel chứa cả cột `Result_Biased` để đối chiếu thời điểm thêm lỗi.
 """)
 
 with st.sidebar:
@@ -249,7 +258,6 @@ if f_train and f_verify:
     col_res = c1.selectbox("Cột Kết quả (Results)", all_cols)
     col_day = c2.selectbox("Cột Ngày (Days)", all_cols)
 
-    # --- INPUT BLOCK SIZE (Ẩn Frequency nếu là EWMA) ---
     st.divider()
     st.subheader(f"4. Cấu hình tham số cho {model}")
     
@@ -288,7 +296,6 @@ if f_train and f_verify:
                 engine = PBRTQCEngine(df_train, df_verify, col_res, col_day, trunc_range)
                 
                 results = []
-                # Dictionary để lưu data xuất Excel
                 excel_sheets = {} 
                 
                 prog_bar = st.progress(0)
@@ -309,20 +316,15 @@ if f_train and f_verify:
                         **metrics
                     }
                     results.append(res_row)
-                    
-                    # Lưu dataframe vào dict để lát xuất excel
                     excel_sheets[f"Case_N{case['bs']}"] = export_df
-                    
                     prog_bar.progress((i+1)/len(cases_config))
                 
                 st.subheader("📊 Bảng Kết quả Đánh giá")
                 st.dataframe(pd.DataFrame(results).style.highlight_max(subset=['Detected (%)'], color='#d1ffbd'), use_container_width=True)
                 
-                # --- NÚT DOWNLOAD EXCEL ---
                 st.divider()
                 st.subheader("📥 Xuất dữ liệu")
                 
-                # Tạo file Excel trong bộ nhớ đệm
                 output = io.BytesIO()
                 with pd.ExcelWriter(output, engine='openpyxl') as writer:
                     for sheet_name, df in excel_sheets.items():
