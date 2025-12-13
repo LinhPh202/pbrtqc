@@ -104,15 +104,17 @@ class PBRTQCEngine:
     def run_continuous_simulation(self, method, param, lcl, ucl, bias_pct, frequency=1, num_sims=None, fixed_inject_idx=None):
         total_days = 0
         detected_days = 0
-        false_positive_days = 0
         nped_list = []
         
+        # --- BIẾN ĐẾM FPR MỚI (EVENT-BASED) ---
+        total_clean_checks = 0    # Tổng mẫu số (Số kết quả AON sạch được kiểm tra)
+        total_false_alarms = 0    # Tổng tử số (Số kết quả AON báo động giả)
+        # --------------------------------------
+
         bias_factor = 1 + (bias_pct / 100.0)
         
-        # --- CHUẨN BỊ DỮ LIỆU ĐỂ XUẤT EXCEL ---
-        # Tạo bản sao của dữ liệu gốc để lưu giá trị Biased cho mục đích hiển thị
+        # Chuẩn bị dữ liệu xuất Excel
         global_biased_export = self.global_vals.copy()
-        # Tạo mảng đánh dấu xem dòng nào bị tiêm lỗi
         injection_flags = np.zeros(len(self.global_vals), dtype=int)
         
         # Tính Global Clean MA (để check FP)
@@ -143,25 +145,34 @@ class PBRTQCEngine:
             
             global_inject_idx = start_idx + local_inject
             
-            # --- CẬP NHẬT DỮ LIỆU EXCEL (BIASED DATA) ---
-            # Lưu lại dữ liệu biased của ngày này vào mảng global export
-            # (Chỉ để xuất Excel, không dùng để tính toán simulation tiếp theo vì logic reset ngày)
+            # --- CẬP NHẬT DỮ LIỆU EXCEL ---
             global_biased_export[global_inject_idx : end_idx] *= bias_factor
             injection_flags[global_inject_idx : end_idx] = 1
-            # ---------------------------------------------
 
-            # 1. CHECK FALSE POSITIVE (Trên Clean Run)
+            # 1. CHECK FALSE POSITIVE (Sửa Logic: Event-based)
+            # Vùng sạch: Từ đầu ngày đến trước điểm tiêm lỗi
             region_mask = valid_check_points[start_idx : global_inject_idx]
             region_vals = global_ma_clean[start_idx : global_inject_idx]
+            
+            # Lấy các giá trị AON thực tế được kiểm tra (theo frequency)
             check_vals = region_vals[region_mask]
+            
+            # Cập nhật mẫu số (Tổng số AON sạch đã check)
+            total_clean_checks += len(check_vals)
             
             if len(check_vals) > 0:
                 alarms = (check_vals < lcl) | (check_vals > ucl)
-                if np.any(alarms):
-                    false_positive_days += 1
+                num_false_alarms_today = np.sum(alarms)
+                
+                # Cập nhật tử số (Tổng số Alarm giả)
+                total_false_alarms += num_false_alarms_today
+                
+                if num_false_alarms_today > 0:
+                    # Nếu có báo động giả, ta vẫn dừng ngày này (không tính Detection)
+                    # Vì trong thực tế máy đã dừng rồi.
                     continue 
 
-            # 2. CHECK DETECTION (Tính lại MA Biased cho Simulation)
+            # 2. CHECK DETECTION
             temp_global_vals = self.global_vals.copy()
             temp_global_vals[global_inject_idx : end_idx] *= bias_factor
             
@@ -185,21 +196,26 @@ class PBRTQCEngine:
                         nped = first_valid_alarm_rel_idx + 1
                         nped_list.append(nped)
 
+        # --- TÍNH TOÁN FPR THEO LOGIC MỚI ---
+        real_fpr_pct = 0.0
+        if total_clean_checks > 0:
+            real_fpr_pct = (total_false_alarms / total_clean_checks) * 100.0
+        # -------------------------------------
+
         metrics = {
             "Total Days": total_days,
             "Detected (%)": round(detected_days / total_days * 100, 1) if total_days > 0 else 0,
-            "False Positive (%)": round(false_positive_days / total_days * 100, 1) if total_days > 0 else 0,
+            "Real FPR (%)": round(real_fpr_pct, 2),  # Tên mới
             "ANPed": round(np.mean(nped_list), 1) if nped_list else "N/A",
             "Median NPed": round(np.median(nped_list), 1) if nped_list else "N/A",
             "95th NPed": round(np.percentile(nped_list, 95), 1) if nped_list else "N/A"
         }
         
-        # --- TẠO DATAFRAME ĐỂ XUẤT EXCEL ---
         export_data = pd.DataFrame({
             'Day': self.global_days,
             'Result_Original': self.global_vals,
-            'Result_Biased': global_biased_export,   # <-- Cột bạn cần
-            'Is_Injected': injection_flags,          # <-- Cột đánh dấu 0/1
+            'Result_Biased': global_biased_export,
+            'Is_Injected': injection_flags,
             f'{method}_Clean': global_ma_clean,
             'LCL': lcl,
             'UCL': ucl
@@ -216,8 +232,7 @@ st.set_page_config(layout="wide", page_title="PBRTQC Simulator Pro")
 st.title("🏥 PBRTQC Continuous Simulator")
 st.markdown("""
 Hệ thống mô phỏng PBRTQC (Continuous Logic).
-- **EWMA:** Ẩn Frequency (mặc định check từng điểm).
-- **Export:** File Excel chứa cả cột `Result_Biased` để đối chiếu thời điểm thêm lỗi.
+- **FPR Calculation:** Tính dựa trên tổng số sự kiện báo động giả / tổng số kết quả AON sạch (Event-based).
 """)
 
 with st.sidebar:
@@ -269,7 +284,6 @@ if f_train and f_verify:
             st.markdown(f"**Case {idx}**")
             bs = st.number_input(f"Block Size (N)", value=20*idx, key=f"bs{idx}", min_value=2)
             freq = 1
-            # CHỈ HIỆN FREQUENCY NẾU LÀ SMA
             if model == "SMA":
                 freq = st.number_input("Frequency", value=1, key=f"freq{idx}", min_value=1)
             return {'bs': bs, 'freq': freq}
