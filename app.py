@@ -14,7 +14,6 @@ def load_data(file_train, file_verify, col_res, col_day):
         df_train = pd.read_excel(file_train)
         df_verify = pd.read_excel(file_verify)
         
-        # Loại bỏ dòng trống
         df_train = df_train.dropna(subset=[col_res])
         df_verify = df_verify.dropna(subset=[col_res, col_day])
         
@@ -85,7 +84,11 @@ class PBRTQCEngine:
             current_idx += count
 
     def calculate_ma(self, values, method, param):
-        """Tính MA trên toàn bộ chuỗi"""
+        """
+        Tính toán Moving Average.
+        - EWMA: Tính liên tục từng điểm (Continuous) để giữ 'Memory'.
+        - SMA: Tính rolling window.
+        """
         series = pd.Series(values)
         if method == 'SMA':
             return series.rolling(window=int(param)).mean().bfill().values
@@ -106,10 +109,9 @@ class PBRTQCEngine:
         detected_days = 0
         nped_list = []
         
-        # --- BIẾN ĐẾM FPR MỚI (EVENT-BASED) ---
-        total_clean_checks = 0    # Tổng mẫu số (Số kết quả AON sạch được kiểm tra)
-        total_false_alarms = 0    # Tổng tử số (Số kết quả AON báo động giả)
-        # --------------------------------------
+        # --- BIẾN ĐẾM FPR (EVENT-BASED) ---
+        total_clean_checks = 0    
+        total_false_alarms = 0    
 
         bias_factor = 1 + (bias_pct / 100.0)
         
@@ -118,9 +120,11 @@ class PBRTQCEngine:
         injection_flags = np.zeros(len(self.global_vals), dtype=int)
         
         # Tính Global Clean MA (để check FP)
+        # EWMA tính full các điểm tại đây
         global_ma_clean = self.calculate_ma(self.global_vals, method, param)
         
-        # Mảng Index check Frequency
+        # Mảng Index check Frequency (Áp dụng cho CẢ EWMA và SMA)
+        # Chỉ những index này mới được dùng để Check Alarm và Report
         global_indices = np.arange(len(self.global_vals))
         valid_check_points = (global_indices % frequency == 0)
 
@@ -145,39 +149,36 @@ class PBRTQCEngine:
             
             global_inject_idx = start_idx + local_inject
             
-            # --- CẬP NHẬT DỮ LIỆU EXCEL ---
+            # --- CẬP NHẬT DỮ LIỆU EXCEL (BIASED DATA) ---
             global_biased_export[global_inject_idx : end_idx] *= bias_factor
             injection_flags[global_inject_idx : end_idx] = 1
 
-            # 1. CHECK FALSE POSITIVE (Sửa Logic: Event-based)
-            # Vùng sạch: Từ đầu ngày đến trước điểm tiêm lỗi
+            # 1. CHECK FALSE POSITIVE (Event-based)
+            # Lấy các điểm trong vùng sạch
             region_mask = valid_check_points[start_idx : global_inject_idx]
             region_vals = global_ma_clean[start_idx : global_inject_idx]
             
-            # Lấy các giá trị AON thực tế được kiểm tra (theo frequency)
+            # Chỉ lấy các giá trị tại điểm Frequency
             check_vals = region_vals[region_mask]
             
-            # Cập nhật mẫu số (Tổng số AON sạch đã check)
             total_clean_checks += len(check_vals)
             
             if len(check_vals) > 0:
                 alarms = (check_vals < lcl) | (check_vals > ucl)
                 num_false_alarms_today = np.sum(alarms)
-                
-                # Cập nhật tử số (Tổng số Alarm giả)
                 total_false_alarms += num_false_alarms_today
                 
                 if num_false_alarms_today > 0:
-                    # Nếu có báo động giả, ta vẫn dừng ngày này (không tính Detection)
-                    # Vì trong thực tế máy đã dừng rồi.
                     continue 
 
             # 2. CHECK DETECTION
             temp_global_vals = self.global_vals.copy()
             temp_global_vals[global_inject_idx : end_idx] *= bias_factor
             
+            # Tính lại MA (Liên tục)
             global_ma_biased = self.calculate_ma(temp_global_vals, method, param)
             
+            # Lọc các điểm cần report
             region_mask_post = valid_check_points[global_inject_idx : end_idx]
             region_vals_post = global_ma_biased[global_inject_idx : end_idx]
             check_vals_post = region_vals_post[region_mask_post]
@@ -186,7 +187,6 @@ class PBRTQCEngine:
                 alarms_post = (check_vals_post < lcl) | (check_vals_post > ucl)
                 if np.any(alarms_post):
                     detected_days += 1
-                    indices_in_region = np.arange(global_inject_idx, end_idx)
                     full_post_region = global_ma_biased[global_inject_idx:end_idx]
                     is_alarm = (full_post_region < lcl) | (full_post_region > ucl)
                     valid_alarm_mask = is_alarm & valid_check_points[global_inject_idx:end_idx]
@@ -196,27 +196,36 @@ class PBRTQCEngine:
                         nped = first_valid_alarm_rel_idx + 1
                         nped_list.append(nped)
 
-        # --- TÍNH TOÁN FPR THEO LOGIC MỚI ---
+        # --- TÍNH TOÁN FPR ---
         real_fpr_pct = 0.0
         if total_clean_checks > 0:
             real_fpr_pct = (total_false_alarms / total_clean_checks) * 100.0
-        # -------------------------------------
 
         metrics = {
             "Total Days": total_days,
             "Detected (%)": round(detected_days / total_days * 100, 1) if total_days > 0 else 0,
-            "Real FPR (%)": round(real_fpr_pct, 2),  # Tên mới
+            "Real FPR (%)": round(real_fpr_pct, 2),
             "ANPed": round(np.mean(nped_list), 1) if nped_list else "N/A",
             "Median NPed": round(np.median(nped_list), 1) if nped_list else "N/A",
             "95th NPed": round(np.percentile(nped_list, 95), 1) if nped_list else "N/A"
         }
         
+        # --- TẠO CỘT AON RESULTS (Reported) ---
+        global_ma_biased_export = self.calculate_ma(global_biased_export, method, param)
+        
+        # Tạo cột AON: Chỉ điền giá trị tại các điểm valid_check_points
+        aon_results = np.full(len(global_ma_biased_export), np.nan)
+        report_indices = np.where(valid_check_points)[0]
+        aon_results[report_indices] = global_ma_biased_export[report_indices]
+
+        # --- TẠO DATAFRAME EXCEL ---
         export_data = pd.DataFrame({
             'Day': self.global_days,
             'Result_Original': self.global_vals,
             'Result_Biased': global_biased_export,
             'Is_Injected': injection_flags,
-            f'{method}_Clean': global_ma_clean,
+            f'{method}_Clean_Full': global_ma_clean, # Giá trị tính liên tục
+            'AON_Results': aon_results,              # Giá trị được report theo Frequency
             'LCL': lcl,
             'UCL': ucl
         })
@@ -231,8 +240,9 @@ st.set_page_config(layout="wide", page_title="PBRTQC Simulator Pro")
 
 st.title("🏥 PBRTQC Continuous Simulator")
 st.markdown("""
-Hệ thống mô phỏng PBRTQC (Continuous Logic).
-- **FPR Calculation:** Tính dựa trên tổng số sự kiện báo động giả / tổng số kết quả AON sạch (Event-based).
+Hệ thống mô phỏng PBRTQC.
+- **Continuous Calculation:** MA được tính toán liên tục cho mọi điểm dữ liệu.
+- **Reporting Frequency:** Kết quả (AON) chỉ được báo cáo và kiểm tra lỗi tại các điểm Frequency.
 """)
 
 with st.sidebar:
@@ -279,13 +289,14 @@ if f_train and f_verify:
     col_case1, col_case2, col_case3 = st.columns(3)
     cases_config = []
     
+    # HÀM NHẬP LIỆU: ĐÃ BỎ ĐIỀU KIỆN ẨN FREQUENCY CHO EWMA
     def create_case_input(col, idx):
         with col:
             st.markdown(f"**Case {idx}**")
-            bs = st.number_input(f"Block Size (N)", value=20*idx, key=f"bs{idx}", min_value=2)
-            freq = 1
-            if model == "SMA":
-                freq = st.number_input("Frequency", value=1, key=f"freq{idx}", min_value=1)
+            bs = st.number_input(f"Block Size (N)", value=20*idx, key=f"bs{idx}", min_value=2, 
+                                 help="Với EWMA: N dùng để tính Lambda. Với SMA: N là cửa sổ trượt.")
+            freq = st.number_input("Frequency", value=1, key=f"freq{idx}", min_value=1,
+                                 help="Số lượng mẫu giữa mỗi lần báo cáo kết quả (Check Interval).")
             return {'bs': bs, 'freq': freq}
 
     cases_config.append(create_case_input(col_case1, 1))
@@ -325,12 +336,12 @@ if f_train and f_verify:
                     )
                     
                     res_row = {
-                        "Case": f"N={case['bs']}",
+                        "Case": f"N={case['bs']}, Freq={case['freq']}",
                         "LCL": round(lcl, 2), "UCL": round(ucl, 2),
                         **metrics
                     }
                     results.append(res_row)
-                    excel_sheets[f"Case_N{case['bs']}"] = export_df
+                    excel_sheets[f"Case_N{case['bs']}_F{case['freq']}"] = export_df
                     prog_bar.progress((i+1)/len(cases_config))
                 
                 st.subheader("📊 Bảng Kết quả Đánh giá")
