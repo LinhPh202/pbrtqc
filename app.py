@@ -52,7 +52,7 @@ def find_optimal_truncation(data_array, max_cut_percent=0.10, steps=10):
     return best_range
 
 # =========================================================
-# 🧠 PHẦN 2: ENGINE MÔ PHỎNG (CONTINUOUS MODE)
+# 🧠 PHẦN 2: ENGINE MÔ PHỎNG (STRIDE LOGIC & NPED CALC)
 # =========================================================
 
 class PBRTQCEngine:
@@ -65,7 +65,7 @@ class PBRTQCEngine:
         raw_train = df_train[col_res].values
         self.train_clean = raw_train[(raw_train >= self.trunc_min) & (raw_train <= self.trunc_max)]
         
-        # 2. Verify Data (Continuous)
+        # 2. Verify Data
         self.df_verify_clean = df_verify[
             (df_verify[col_res] >= self.trunc_min) & 
             (df_verify[col_res] <= self.trunc_max)
@@ -83,50 +83,55 @@ class PBRTQCEngine:
             self.day_indices[day] = (current_idx, current_idx + count)
             current_idx += count
 
-    def calculate_ma(self, values, method, param):
-        """
-        Tính toán Moving Average.
-        - EWMA: Tính liên tục từng điểm (Continuous) để giữ 'Memory'.
-        - SMA: Tính rolling window.
-        """
+    def calculate_ma(self, values, method, block_size):
+        """Tính MA liên tục"""
         series = pd.Series(values)
         if method == 'SMA':
-            return series.rolling(window=int(param)).mean().bfill().values
+            return series.rolling(window=int(block_size)).mean().values
         elif method == 'EWMA':
-            lam = 2 / (int(param) + 1)
+            lam = 2 / (int(block_size) + 1)
             return series.ewm(alpha=lam, adjust=False).mean().values
         return values
 
-    def determine_limits(self, method, param, target_fpr):
-        """Tính Limit từ Training Data"""
-        ma_values = self.calculate_ma(self.train_clean, method, param)
-        lower = np.percentile(ma_values, (target_fpr/2)*100)
-        upper = np.percentile(ma_values, (1 - target_fpr/2)*100)
+    def get_report_mask(self, total_length, block_size, frequency):
+        """Tạo mask xác định các điểm Report (N, N+F, N+2F...)"""
+        mask = np.zeros(total_length, dtype=bool)
+        start_idx = int(block_size) - 1
+        if start_idx < total_length:
+            report_indices = np.arange(start_idx, total_length, int(frequency))
+            mask[report_indices] = True
+        return mask
+
+    def determine_limits(self, method, block_size, frequency, target_fpr):
+        """Tính Limit dựa trên các điểm Report của Training Data"""
+        ma_values = self.calculate_ma(self.train_clean, method, block_size)
+        mask = self.get_report_mask(len(ma_values), block_size, frequency)
+        valid_ma_values = ma_values[mask]
+        
+        if len(valid_ma_values) == 0:
+            return 0, 0 
+
+        lower = np.percentile(valid_ma_values, (target_fpr/2)*100)
+        upper = np.percentile(valid_ma_values, (1 - target_fpr/2)*100)
         return lower, upper
 
-    def run_continuous_simulation(self, method, param, lcl, ucl, bias_pct, frequency=1, num_sims=None, fixed_inject_idx=None):
+    def run_simulation(self, method, block_size, frequency, lcl, ucl, bias_pct, num_sims=None, fixed_inject_idx=None):
         total_days = 0
         detected_days = 0
         nped_list = []
         
-        # --- BIẾN ĐẾM FPR (EVENT-BASED) ---
         total_clean_checks = 0    
         total_false_alarms = 0    
 
         bias_factor = 1 + (bias_pct / 100.0)
         
-        # Chuẩn bị dữ liệu xuất Excel
+        # 1. Tính Clean MA & Report Mask
+        global_ma_clean = self.calculate_ma(self.global_vals, method, block_size)
+        global_report_mask = self.get_report_mask(len(self.global_vals), block_size, frequency)
+
+        # 2. Chuẩn bị xuất Excel
         global_biased_export = self.global_vals.copy()
         injection_flags = np.zeros(len(self.global_vals), dtype=int)
-        
-        # Tính Global Clean MA (để check FP)
-        # EWMA tính full các điểm tại đây
-        global_ma_clean = self.calculate_ma(self.global_vals, method, param)
-        
-        # Mảng Index check Frequency (Áp dụng cho CẢ EWMA và SMA)
-        # Chỉ những index này mới được dùng để Check Alarm và Report
-        global_indices = np.arange(len(self.global_vals))
-        valid_check_points = (global_indices % frequency == 0)
 
         days_to_run = list(self.day_indices.keys())
         if num_sims and num_sims < len(days_to_run):
@@ -135,7 +140,10 @@ class PBRTQCEngine:
         for day_name in days_to_run:
             start_idx, end_idx = self.day_indices[day_name]
             day_len = end_idx - start_idx
-            if day_len < 5: continue
+            
+            # Nếu ngày ngắn hơn Block Size thì không thể tính AON -> Bỏ qua
+            if day_len < block_size: continue
+                
             total_days += 1
             
             # --- CHỌN ĐIỂM TIÊM LỖI ---
@@ -149,83 +157,87 @@ class PBRTQCEngine:
             
             global_inject_idx = start_idx + local_inject
             
-            # --- CẬP NHẬT DỮ LIỆU EXCEL (BIASED DATA) ---
+            # Cập nhật Data Export
             global_biased_export[global_inject_idx : end_idx] *= bias_factor
             injection_flags[global_inject_idx : end_idx] = 1
 
-            # 1. CHECK FALSE POSITIVE (Event-based)
-            # Lấy các điểm trong vùng sạch
-            region_mask = valid_check_points[start_idx : global_inject_idx]
-            region_vals = global_ma_clean[start_idx : global_inject_idx]
+            # 1. CHECK FALSE POSITIVE (Vùng trước lỗi)
+            clean_check_mask = np.zeros(len(self.global_vals), dtype=bool)
+            clean_check_mask[start_idx : global_inject_idx] = True
             
-            # Chỉ lấy các giá trị tại điểm Frequency
-            check_vals = region_vals[region_mask]
-            
-            total_clean_checks += len(check_vals)
+            final_clean_mask = clean_check_mask & global_report_mask
+            check_vals = global_ma_clean[final_clean_mask]
             
             if len(check_vals) > 0:
+                total_clean_checks += len(check_vals)
                 alarms = (check_vals < lcl) | (check_vals > ucl)
-                num_false_alarms_today = np.sum(alarms)
-                total_false_alarms += num_false_alarms_today
+                num_fp = np.sum(alarms)
+                total_false_alarms += num_fp
                 
-                if num_false_alarms_today > 0:
-                    continue 
+                if num_fp > 0:
+                    continue # False Alarm Day -> Skip
 
-            # 2. CHECK DETECTION
+            # 2. CHECK DETECTION (Vùng sau lỗi)
             temp_global_vals = self.global_vals.copy()
             temp_global_vals[global_inject_idx : end_idx] *= bias_factor
             
-            # Tính lại MA (Liên tục)
-            global_ma_biased = self.calculate_ma(temp_global_vals, method, param)
+            # Tính lại MA với Bias
+            global_ma_biased = self.calculate_ma(temp_global_vals, method, block_size)
             
-            # Lọc các điểm cần report
-            region_mask_post = valid_check_points[global_inject_idx : end_idx]
-            region_vals_post = global_ma_biased[global_inject_idx : end_idx]
-            check_vals_post = region_vals_post[region_mask_post]
+            # Mask vùng bị lỗi
+            biased_check_mask = np.zeros(len(self.global_vals), dtype=bool)
+            biased_check_mask[global_inject_idx : end_idx] = True
+            
+            final_biased_mask = biased_check_mask & global_report_mask
+            check_vals_post = global_ma_biased[final_biased_mask]
             
             if len(check_vals_post) > 0:
                 alarms_post = (check_vals_post < lcl) | (check_vals_post > ucl)
+                
                 if np.any(alarms_post):
                     detected_days += 1
-                    full_post_region = global_ma_biased[global_inject_idx:end_idx]
-                    is_alarm = (full_post_region < lcl) | (full_post_region > ucl)
-                    valid_alarm_mask = is_alarm & valid_check_points[global_inject_idx:end_idx]
                     
-                    if np.any(valid_alarm_mask):
-                        first_valid_alarm_rel_idx = np.argmax(valid_alarm_mask)
-                        nped = first_valid_alarm_rel_idx + 1
+                    # --- TÍNH NPed CHÍNH XÁC ---
+                    # Lấy tất cả index (toàn cục) thỏa mãn điều kiện report trong vùng lỗi
+                    valid_indices = np.where(final_biased_mask)[0]
+                    
+                    # Lọc ra các index có Alarm
+                    # Lưu ý: alarms_post tương ứng với valid_indices
+                    alarm_indices = valid_indices[alarms_post]
+                    
+                    if len(alarm_indices) > 0:
+                        first_alarm_idx = alarm_indices[0] # Index toàn cục của điểm báo động đầu tiên
+                        
+                        # Công thức: Alarm Index - Injection Index + 1
+                        nped = first_alarm_idx - global_inject_idx + 1
                         nped_list.append(nped)
 
-        # --- TÍNH TOÁN FPR ---
+        # --- TỔNG HỢP METRICS ---
         real_fpr_pct = 0.0
         if total_clean_checks > 0:
             real_fpr_pct = (total_false_alarms / total_clean_checks) * 100.0
-
+            
         metrics = {
             "Total Days": total_days,
             "Detected (%)": round(detected_days / total_days * 100, 1) if total_days > 0 else 0,
             "Real FPR (%)": round(real_fpr_pct, 2),
             "ANPed": round(np.mean(nped_list), 1) if nped_list else "N/A",
-            "Median NPed": round(np.median(nped_list), 1) if nped_list else "N/A",
-            "95th NPed": round(np.percentile(nped_list, 95), 1) if nped_list else "N/A"
+            "MNPed": round(np.median(nped_list), 1) if nped_list else "N/A",
+            "95NPed": round(np.percentile(nped_list, 95), 1) if nped_list else "N/A"
         }
         
-        # --- TẠO CỘT AON RESULTS (Reported) ---
-        global_ma_biased_export = self.calculate_ma(global_biased_export, method, param)
-        
-        # Tạo cột AON: Chỉ điền giá trị tại các điểm valid_check_points
+        # --- EXCEL EXPORT ---
+        global_ma_biased_export = self.calculate_ma(global_biased_export, method, block_size)
         aon_results = np.full(len(global_ma_biased_export), np.nan)
-        report_indices = np.where(valid_check_points)[0]
-        aon_results[report_indices] = global_ma_biased_export[report_indices]
+        aon_results[global_report_mask] = global_ma_biased_export[global_report_mask]
 
-        # --- TẠO DATAFRAME EXCEL ---
         export_data = pd.DataFrame({
             'Day': self.global_days,
             'Result_Original': self.global_vals,
             'Result_Biased': global_biased_export,
             'Is_Injected': injection_flags,
-            f'{method}_Clean_Full': global_ma_clean, # Giá trị tính liên tục
-            'AON_Results': aon_results,              # Giá trị được report theo Frequency
+            f'{method}_Continuous': global_ma_clean,
+            'AON_Reported': aon_results,
             'LCL': lcl,
             'UCL': ucl
         })
@@ -238,11 +250,9 @@ class PBRTQCEngine:
 
 st.set_page_config(layout="wide", page_title="PBRTQC Simulator Pro")
 
-st.title("🏥 PBRTQC Continuous Simulator")
+st.title("🏥 PBRTQC Simulator: Stride Logic")
 st.markdown("""
-Hệ thống mô phỏng PBRTQC.
-- **Continuous Calculation:** MA được tính toán liên tục cho mọi điểm dữ liệu.
-- **Reporting Frequency:** Kết quả (AON) chỉ được báo cáo và kiểm tra lỗi tại các điểm Frequency.
+**Hệ thống hỗ trợ tính toán PBRTQC**
 """)
 
 with st.sidebar:
@@ -289,14 +299,13 @@ if f_train and f_verify:
     col_case1, col_case2, col_case3 = st.columns(3)
     cases_config = []
     
-    # HÀM NHẬP LIỆU: ĐÃ BỎ ĐIỀU KIỆN ẨN FREQUENCY CHO EWMA
     def create_case_input(col, idx):
         with col:
             st.markdown(f"**Case {idx}**")
-            bs = st.number_input(f"Block Size (N)", value=20*idx, key=f"bs{idx}", min_value=2, 
-                                 help="Với EWMA: N dùng để tính Lambda. Với SMA: N là cửa sổ trượt.")
-            freq = st.number_input("Frequency", value=1, key=f"freq{idx}", min_value=1,
-                                 help="Số lượng mẫu giữa mỗi lần báo cáo kết quả (Check Interval).")
+            bs = st.number_input(f"Block Size (N)", value=20*idx, key=f"bs{idx}", min_value=2,
+                                 help="Kích thước cửa sổ tính toán (Window Size).")
+            freq = st.number_input("Frequency (F)", value=1, key=f"freq{idx}", min_value=1,
+                                 help="Bước nhảy báo cáo (Stride).")
             return {'bs': bs, 'freq': freq}
 
     cases_config.append(create_case_input(col_case1, 1))
@@ -304,13 +313,12 @@ if f_train and f_verify:
     cases_config.append(create_case_input(col_case3, 3))
 
     if st.button("🚀 Run Simulation"):
-        with st.spinner("Đang xử lý dữ liệu..."):
+        with st.spinner("Đang chạy mô phỏng..."):
             df_train, df_verify = load_data(f_train, f_verify, col_res, col_day)
             
             if df_train is not None:
                 trunc_range = (0, 0)
                 data_train_vals = df_train[col_res].dropna().values
-                
                 if trunc_mode == "Auto (Tự động)":
                     trunc_range = find_optimal_truncation(data_train_vals)
                     st.success(f"✅ Auto Truncation: [{trunc_range[0]:.2f} - {trunc_range[1]:.2f}]")
@@ -326,17 +334,20 @@ if f_train and f_verify:
                 prog_bar = st.progress(0)
                 
                 for i, case in enumerate(cases_config):
-                    lcl, ucl = engine.determine_limits(model, case['bs'], target_fpr)
+                    lcl, ucl = engine.determine_limits(model, case['bs'], case['freq'], target_fpr)
                     
-                    metrics, export_df = engine.run_continuous_simulation(
-                        model, case['bs'], lcl, ucl, bias_pct,
+                    metrics, export_df = engine.run_simulation(
+                        method=model, 
+                        block_size=case['bs'], 
                         frequency=case['freq'],
+                        lcl=lcl, ucl=ucl, 
+                        bias_pct=bias_pct,
                         num_sims=max_days, 
                         fixed_inject_idx=fixed_point
                     )
                     
                     res_row = {
-                        "Case": f"N={case['bs']}, Freq={case['freq']}",
+                        "Case": f"N={case['bs']}, F={case['freq']}",
                         "LCL": round(lcl, 2), "UCL": round(ucl, 2),
                         **metrics
                     }
@@ -356,11 +367,10 @@ if f_train and f_verify:
                         df.to_excel(writer, sheet_name=sheet_name, index=False)
                 
                 st.download_button(
-                    label="Tải xuống chi tiết kết quả (.xlsx)",
+                    label="Tải xuống chi tiết (.xlsx)",
                     data=output.getvalue(),
                     file_name="PBRTQC_Simulation_Results.xlsx",
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
                 )
-
             else:
-                st.error("Không đọc được dữ liệu.")
+                st.error("Lỗi dữ liệu.")
