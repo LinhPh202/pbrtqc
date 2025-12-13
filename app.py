@@ -82,7 +82,7 @@ class PBRTQCEngine:
         upper = np.percentile(ma_values, (1 - target_fpr/2)*100)
         return lower, upper
 
-    def run_day_simulation(self, method, param, lcl, ucl, bias_pct, num_sims=None):
+    def run_day_simulation(self, method, param, lcl, ucl, bias_pct, num_sims=None, fixed_inject_idx=None):
         grouped = self.df_verify_clean.groupby(self.col_day)
         
         total_days = 0
@@ -103,10 +103,22 @@ class PBRTQCEngine:
             if n < 5: continue 
             
             total_days += 1
-            max_idx = min(40, n - 2) 
-            if max_idx < 1: max_idx = 1
-            injection_point = np.random.randint(1, max_idx + 1)
             
+            # --- LOGIC CHỌN ĐIỂM TIÊM LỖI (INJECTION POINT) ---
+            if fixed_inject_idx is not None:
+                # Chế độ Cố định:
+                # Nếu điểm cố định lớn hơn số mẫu của ngày hôm đó, ta sẽ set nó bằng n-1 (cuối ngày) hoặc bỏ qua
+                # Ở đây ta chọn cách: set bằng fixed_inject_idx, nhưng không vượt quá n-1
+                injection_point = min(fixed_inject_idx, n - 1)
+                # Đảm bảo index ít nhất là 1 để có đoạn đầu sạch
+                injection_point = max(1, injection_point)
+            else:
+                # Chế độ Ngẫu nhiên (Random 1-40):
+                max_idx = min(40, n - 2) 
+                if max_idx < 1: max_idx = 1
+                injection_point = np.random.randint(1, max_idx + 1)
+            # ---------------------------------------------------
+
             # Check False Positive
             ma_clean_full = self.calculate_ma(vals, method, param)
             pre_bias_alarms = (ma_clean_full[:injection_point] < lcl) | (ma_clean_full[:injection_point] > ucl)
@@ -159,7 +171,7 @@ class PBRTQCEngine:
         return metrics, plot_data
 
 # =========================================================
-# 🖥️ PHẦN 3: GIAO DIỆN STREAMLIT (CẬP NHẬT INPUT)
+# 🖥️ PHẦN 3: GIAO DIỆN STREAMLIT
 # =========================================================
 
 st.set_page_config(layout="wide", page_title="PBRTQC Day-Simulator")
@@ -178,6 +190,16 @@ with st.sidebar:
     target_fpr = st.slider("Target FPR (%)", 0.1, 10.0, 2.0, 0.1) / 100
     model = st.selectbox("Model", ["EWMA", "SMA"])
     max_days = st.slider("Giới hạn số ngày chạy", 10, 5000, 500)
+    
+    # --- [MỚI] CHỌN CHẾ ĐỘ THÊM LỖI ---
+    st.divider()
+    st.subheader("3. Injection Mode (Chế độ thêm lỗi)")
+    inject_mode = st.radio("Chọn cách thêm Bias:", ["Ngẫu nhiên (Random 1-40)", "Cố định (Fixed Point)"])
+    
+    fixed_point = None
+    if inject_mode == "Cố định (Fixed Point)":
+        fixed_point = st.number_input("Chọn vị trí mẫu bắt đầu thêm lỗi:", min_value=1, value=20, help="Lỗi sẽ bắt đầu từ mẫu số này trong mỗi ngày.")
+    # ----------------------------------
 
 if f_train and f_verify:
     df_temp = pd.read_excel(f_train, nrows=1)
@@ -187,45 +209,26 @@ if f_train and f_verify:
     col_res = c1.selectbox("Cột Kết quả (Results)", all_cols)
     col_day = c2.selectbox("Cột Ngày (Days)", all_cols)
 
-    # --- [MỚI] PHẦN NHẬP BLOCK SIZE CHO 3 CASE ---
+    # --- INPUT BLOCK SIZE ---
     st.divider()
-    st.subheader(f"3. Cấu hình tham số cho mô hình {model}")
+    st.subheader(f"4. Cấu hình tham số cho mô hình {model}")
     
     col_case1, col_case2, col_case3 = st.columns(3)
-    
     cases_config = []
     
-    # Case 1
-    with col_case1:
-        st.markdown("**Case 1**")
-        bs1 = st.number_input("Block Size (N)", value=20, key="bs1", min_value=2)
-        freq1 = 1
-        # Nếu là SMA thì hiện thêm ô nhập Frequency
-        # Nếu là EWMA thì Frequency mặc định là 1 (vì EWMA tính liên tục từng điểm)
-        # Tuy nhiên logic simulation của bạn có thể áp dụng frequency cho cả EWMA nếu muốn giảm tải
-        # Ở đây mình để Frequency hiện ra cho SMA cho đúng chuẩn sách giáo khoa.
-        if model == "SMA":
-            freq1 = st.number_input("Frequency", value=1, key="freq1", min_value=1)
-        cases_config.append({'bs': bs1, 'freq': freq1})
+    # Hàm tạo input gọn
+    def create_case_input(col, idx):
+        with col:
+            st.markdown(f"**Case {idx}**")
+            bs = st.number_input(f"Block Size (N)", value=20*idx, key=f"bs{idx}", min_value=2)
+            freq = 1
+            if model == "SMA":
+                freq = st.number_input("Frequency", value=1, key=f"freq{idx}", min_value=1)
+            return {'bs': bs, 'freq': freq}
 
-    # Case 2
-    with col_case2:
-        st.markdown("**Case 2**")
-        bs2 = st.number_input("Block Size (N)", value=40, key="bs2", min_value=2)
-        freq2 = 1
-        if model == "SMA":
-            freq2 = st.number_input("Frequency", value=1, key="freq2", min_value=1)
-        cases_config.append({'bs': bs2, 'freq': freq2})
-
-    # Case 3
-    with col_case3:
-        st.markdown("**Case 3**")
-        bs3 = st.number_input("Block Size (N)", value=60, key="bs3", min_value=2)
-        freq3 = 1
-        if model == "SMA":
-            freq3 = st.number_input("Frequency", value=1, key="freq3", min_value=1)
-        cases_config.append({'bs': bs3, 'freq': freq3})
-    # ---------------------------------------------
+    cases_config.append(create_case_input(col_case1, 1))
+    cases_config.append(create_case_input(col_case2, 2))
+    cases_config.append(create_case_input(col_case3, 3))
 
     if st.button("🚀 Run Simulation"):
         with st.spinner("Đang xử lý dữ liệu..."):
@@ -242,12 +245,14 @@ if f_train and f_verify:
                 
                 prog_bar = st.progress(0)
                 
-                # Dùng cases_config từ input người dùng
                 for i, case in enumerate(cases_config):
                     lcl, ucl = engine.determine_limits(model, case['bs'], target_fpr)
                     
+                    # Truyền tham số fixed_inject_idx vào hàm
                     metrics, p_data = engine.run_day_simulation(
-                        model, case['bs'], lcl, ucl, bias_pct, num_sims=max_days
+                        model, case['bs'], lcl, ucl, bias_pct, 
+                        num_sims=max_days, 
+                        fixed_inject_idx=fixed_point  # Truyền giá trị cố định (hoặc None)
                     )
                     
                     res_row = {
@@ -276,12 +281,14 @@ if f_train and f_verify:
                                 ax.plot(d['ma_sim'], label=f'MA (Bias {bias_pct}%)', color='orange')
                             ax.axhline(d['ucl'], color='red', ls='--')
                             ax.axhline(d['lcl'], color='red', ls='--')
-                            ax.axvline(d['inject_idx'], color='black', ls=':', label='Thêm lỗi')
+                            ax.axvline(d['inject_idx'], color='black', ls=':', label=f'Thêm lỗi tại mẫu {d["inject_idx"]}')
+                            
                             if d['alarm_idx'] is not None:
                                 color = 'purple' if d['status'] == 'False Positive' else 'red'
                                 shape = 'X' if d['status'] == 'False Positive' else '*'
                                 y_val = d['ma_clean'][d['alarm_idx']] if d['ma_sim'] is None else d['ma_sim'][d['alarm_idx']]
                                 ax.scatter(d['alarm_idx'], y_val, color=color, s=150, zorder=5, marker=shape, label=f'Alarm ({d["status"]})')
+                            
                             ax.set_title(f"Ngày: {d['day']} - {d['status']}")
                             ax.legend()
                             st.pyplot(fig)
