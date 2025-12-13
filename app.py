@@ -5,37 +5,35 @@ import scipy.stats as stats
 import matplotlib.pyplot as plt
 
 # =========================================================
-# 🚀 PHẦN 1: OPTIMIZED CACHING & DATA PROCESSING
+# 🛠️ PHẦN 1: XỬ LÝ DỮ LIỆU & CACHING
 # =========================================================
 
-# Dùng decorator này để Streamlit nhớ kết quả, không phải tính lại mỗi lần
 @st.cache_data(show_spinner=False)
-def load_and_clean_data(file_train, file_verify, col_name):
-    """Đọc file và tiền xử lý data (Cache lại)"""
+def load_data(file_train, file_verify, col_res, col_day):
+    """Đọc file và lấy cột Days + Results"""
     try:
         df_train = pd.read_excel(file_train)
         df_verify = pd.read_excel(file_verify)
         
-        # Lấy dữ liệu dạng mảng numpy ngay lập tức để nhanh hơn
-        data_train = df_train[col_name].dropna().values
-        data_verify = df_verify[col_name].dropna().values
+        # Lọc bỏ NaN
+        df_train = df_train.dropna(subset=[col_res])
+        df_verify = df_verify.dropna(subset=[col_res, col_day])
         
-        return data_train, data_verify
+        return df_train, df_verify
     except Exception as e:
         return None, None
 
 @st.cache_data(show_spinner=False)
-def find_optimal_truncation(data, max_cut_percent=0.10, steps=10):
-    """Tìm khoảng cắt tối ưu (Đã tối ưu hóa tốc độ)"""
-    # Chỉ lấy mẫu tối đa 5000 điểm để tính Shapiro cho nhanh nếu data quá lớn
-    # Data gốc vẫn giữ nguyên, chỉ dùng sample để tìm ngưỡng
-    calc_data = data
-    if len(data) > 5000:
+def find_optimal_truncation(data_array, max_cut_percent=0.10, steps=10):
+    """Tìm khoảng cắt tối ưu trên dữ liệu Training (1 chiều)"""
+    # Lấy mẫu nếu data quá lớn để tăng tốc
+    calc_data = data_array
+    if len(data_array) > 5000:
         np.random.seed(42)
-        calc_data = np.random.choice(data, 5000, replace=False)
+        calc_data = np.random.choice(data_array, 5000, replace=False)
         
     best_p = -1
-    best_range = (data.min(), data.max())
+    best_range = (data_array.min(), data_array.max())
     
     cuts = np.linspace(0, max_cut_percent, steps)
     sorted_data = np.sort(calc_data)
@@ -49,281 +47,304 @@ def find_optimal_truncation(data, max_cut_percent=0.10, steps=10):
             subset = sorted_data[s:e]
             
             if len(subset) > 20:
-                # Dùng normaltest nhanh hơn shapiro với data lớn
                 stat, p_val = stats.normaltest(subset)
                 if p_val > best_p:
                     best_p = p_val
-                    # Map lại percentile vào data gốc
-                    lower = np.percentile(data, left_cut * 100)
-                    upper = np.percentile(data, (1 - right_cut) * 100)
+                    lower = np.percentile(data_array, left_cut * 100)
+                    upper = np.percentile(data_array, (1 - right_cut) * 100)
                     best_range = (lower, upper)
     return best_range
 
 # =========================================================
-# 🚀 PHẦN 2: HIGH-PERFORMANCE ENGINE (VECTORIZED)
+# 🧠 PHẦN 2: ENGINE MÔ PHỎNG THEO NGÀY (DAY-BASED)
 # =========================================================
 
 class PBRTQCEngine:
-    def __init__(self, train_data, verify_data, trunc_range):
-        # Lưu trữ dưới dạng numpy array float64 để tính toán nhanh nhất
-        self.raw_train = np.array(train_data, dtype=np.float64)
-        self.raw_verify = np.array(verify_data, dtype=np.float64)
+    def __init__(self, df_train, df_verify, col_res, col_day, trunc_range):
         self.trunc_min, self.trunc_max = trunc_range
+        self.col_res = col_res
+        self.col_day = col_day
         
-        # Cắt gọt dữ liệu (Vectorized filtering)
-        self.train = self.raw_train[(self.raw_train >= self.trunc_min) & (self.raw_train <= self.trunc_max)]
-        self.verify = self.raw_verify[(self.raw_verify >= self.trunc_min) & (self.raw_verify <= self.trunc_max)]
+        # 1. Xử lý Training Data (Để tính Limit)
+        raw_train = df_train[col_res].values
+        self.train_clean = raw_train[(raw_train >= self.trunc_min) & (raw_train <= self.trunc_max)]
+        
+        # 2. Xử lý Verify Data (Giữ nguyên cấu trúc DataFrame để group theo ngày)
+        # Apply truncation cho verify: Các giá trị ngoại lai sẽ bị loại bỏ hoặc giữ nguyên tùy logic
+        # Ở đây ta lọc bỏ dòng ngoại lai để không làm nhiễu biểu đồ verify
+        self.df_verify_clean = df_verify[
+            (df_verify[col_res] >= self.trunc_min) & 
+            (df_verify[col_res] <= self.trunc_max)
+        ].copy()
 
-    def calculate_moving_metric(self, data, method, param):
-        """Tính toán MA bằng Pandas (Đã tối ưu C-backend)"""
-        # Chuyển đổi nhanh sang Series để dùng hàm có sẵn
-        series = pd.Series(data)
+    def calculate_ma(self, values, method, param):
+        """Tính MA cho 1 mảng dữ liệu"""
+        series = pd.Series(values)
         if method == 'SMA':
-            # fillna(method='bfill') để tránh lỗi NaN ở đầu
             return series.rolling(window=int(param)).mean().bfill().values
         elif method == 'EWMA':
             lam = 2 / (int(param) + 1)
             return series.ewm(alpha=lam, adjust=False).mean().values
-        return data
+        return values
 
-    def determine_control_limits(self, method, param, target_fpr):
-        ma_values = self.calculate_moving_metric(self.train, method, param)
-        lower_percentile = (target_fpr / 2) * 100
-        upper_percentile = 100 - (target_fpr / 2) * 100
-        
-        # np.percentile rất nhanh
-        lcl = np.percentile(ma_values, lower_percentile)
-        ucl = np.percentile(ma_values, upper_percentile)
-        return lcl, ucl
+    def determine_limits(self, method, param, target_fpr):
+        """Tính Limit dựa trên Training Data"""
+        ma_values = self.calculate_ma(self.train_clean, method, param)
+        lower = np.percentile(ma_values, (target_fpr/2)*100)
+        upper = np.percentile(ma_values, (1 - target_fpr/2)*100)
+        return lower, upper
 
-    def run_simulation_vectorized(self, method, param, lcl, ucl, bias_pct, frequency=1, num_sims=50):
+    def run_day_simulation(self, method, param, lcl, ucl, bias_pct, num_sims=None):
         """
-        Phiên bản siêu tốc độ: Sử dụng NumPy Vectorization thay vì vòng lặp for
+        Logic: Duyệt qua từng ngày.
+        Với mỗi ngày:
+        1. Chọn điểm random k (1-40).
+        2. Check Alarm trước k (Clean) -> Nếu có -> False Positive.
+        3. Thêm Bias từ k -> Check Alarm sau k -> Nếu có -> Detection.
         """
-        verify_data = self.verify
-        n = len(verify_data)
-        if n < 100: return {}, None
-
-        # 1. Tính Real FPR (Vectorized)
-        ma_clean = self.calculate_moving_metric(verify_data, method, param)
         
-        # Tạo mảng chỉ số để check frequency
-        indices = np.arange(n)
-        freq_mask = (indices % frequency == 0) # Chỉ lấy các điểm đúng frequency
+        # Group dữ liệu theo ngày
+        grouped = self.df_verify_clean.groupby(self.col_day)
         
-        # Tìm các điểm vi phạm
-        violations = (ma_clean < lcl) | (ma_clean > ucl)
+        total_days = 0
+        detected_days = 0
+        false_positive_days = 0
+        nped_list = []
         
-        # Kết hợp điều kiện: Vi phạm VÀ đúng frequency
-        valid_alarms = violations & freq_mask
+        plot_data = None # Lưu data ngày cuối để vẽ
         
-        alarms_count = np.sum(valid_alarms)
-        checks_count = np.sum(freq_mask)
-        real_fpr = alarms_count / checks_count if checks_count > 0 else 0
-
-        # 2. Simulation (Vectorized Search)
-        detected_counts = []
         bias_factor = 1 + (bias_pct / 100.0)
+
+        # Lặp qua các ngày
+        # Note: num_sims ở đây có thể hiểu là giới hạn số ngày chạy thử nếu data quá lớn
+        # Nếu None thì chạy hết các ngày có trong file verify
         
-        last_run_data = {}
+        days_to_run = list(grouped.groups.keys())
+        if num_sims and num_sims < len(days_to_run):
+            days_to_run = days_to_run[:num_sims]
 
-        # Pre-calculate random start indices (Vectorized random)
-        # Giới hạn điểm bắt đầu để đảm bảo còn ít nhất 50 mẫu phía sau
-        start_indices = np.random.randint(20, max(21, n - 50), size=num_sims)
+        for day_name in days_to_run:
+            # Lấy dữ liệu của ngày đó
+            day_df = grouped.get_group(day_name)
+            vals = day_df[self.col_res].values.astype(float)
+            n = len(vals)
+            
+            if n < 5: continue # Bỏ qua ngày quá ít mẫu
+            
+            total_days += 1
+            
+            # 1. Chọn điểm tiêm lỗi (Random 1 - 40)
+            # Nếu ngày đó ít hơn 40 mẫu, chọn random trong khoảng độ dài của nó
+            max_idx = min(40, n - 2) 
+            if max_idx < 1: max_idx = 1
+            
+            injection_point = np.random.randint(1, max_idx + 1)
+            
+            # 2. Check False Positive (Kiểm tra Run sạch TRƯỚC điểm tiêm lỗi)
+            # Tính MA cho đoạn clean đầu tiên
+            # Lưu ý: PBRTQC thường chạy liên tục, nhưng ở đây ta giả định reset theo ngày hoặc chạy nối tiếp.
+            # Để đơn giản và cô lập, ta tính MA cho ngày hiện tại.
+            
+            ma_clean_full = self.calculate_ma(vals, method, param)
+            
+            # Kiểm tra xem có alarm nào xuất hiện TRƯỚC injection_point không?
+            # Vùng an toàn: index 0 đến injection_point - 1
+            pre_bias_alarms = (ma_clean_full[:injection_point] < lcl) | (ma_clean_full[:injection_point] > ucl)
+            
+            if np.any(pre_bias_alarms):
+                # Đã báo động TRƯỚC KHI có lỗi -> Báo động giả
+                false_positive_days += 1
+                
+                # Lưu data để debug/vẽ nếu là ngày cuối
+                if day_name == days_to_run[-1]:
+                    plot_data = {
+                        'day': day_name,
+                        'vals_clean': vals,
+                        'ma_clean': ma_clean_full,
+                        'ma_sim': None,
+                        'inject_idx': injection_point,
+                        'alarm_idx': np.argmax(pre_bias_alarms), # Vị trí báo giả đầu tiên
+                        'lcl': lcl, 'ucl': ucl,
+                        'status': 'False Positive'
+                    }
+                continue # Dừng xử lý ngày này (theo yêu cầu user)
 
-        for i, start_idx in enumerate(start_indices):
-            # Tạo data mô phỏng
-            # Copy mảng tốn ít thời gian hơn là tính toán lại từ đầu
-            sim_data = verify_data.copy()
-            sim_data[start_idx:] *= bias_factor # Phép nhân tại chỗ (in-place) nhanh hơn
+            # 3. Tiêm Bias và Check Detection (Sau điểm tiêm lỗi)
+            vals_biased = vals.copy()
+            vals_biased[injection_point:] *= bias_factor
             
-            # Tính lại MA cho toàn bộ chuỗi (Pandas C-optimized rất nhanh, 40k dòng chỉ mất ~2ms)
-            ma_sim = self.calculate_moving_metric(sim_data, method, param)
+            ma_biased = self.calculate_ma(vals_biased, method, param)
             
-            # --- ĐOẠN NÀY LÀ QUAN TRỌNG NHẤT (TỐI ƯU HÓA) ---
-            # Thay vì for loop từng phần tử, ta dùng mask
+            # Chỉ xét vùng SAU injection_point
+            post_bias_region = ma_biased[injection_point:]
+            post_alarms = (post_bias_region < lcl) | (post_bias_region > ucl)
             
-            # Chỉ xét vùng dữ liệu từ start_idx trở đi
-            region_of_interest = ma_sim[start_idx:]
-            
-            # 1. Tìm điểm vượt ngưỡng trong vùng này
-            violation_mask = (region_of_interest < lcl) | (region_of_interest > ucl)
-            
-            # 2. Tìm điểm đúng Frequency trong vùng này
-            # Cần tính lại index toàn cục cho vùng này
-            global_indices_region = np.arange(start_idx, n)
-            freq_mask_region = (global_indices_region % frequency == 0)
-            
-            # 3. Kết hợp điều kiện
-            combined_mask = violation_mask & freq_mask_region
-            
-            # 4. Tìm vị trí True đầu tiên (Argmax trả về index đầu tiên của giá trị Max/True)
-            if np.any(combined_mask):
-                # np.argmax trả về index tương đối trong region
-                relative_first_idx = np.argmax(combined_mask) 
+            if np.any(post_alarms):
+                detected_days += 1
+                first_alarm_idx_rel = np.argmax(post_alarms) # Index tương đối
+                nped = first_alarm_idx_rel + 1 # Số mẫu trôi qua
+                nped_list.append(nped)
                 
-                # Số bệnh nhân trôi qua = index tương đối + 1
-                detected_counts.append(relative_first_idx + 1)
-                
-                # Lưu data lần cuối để vẽ
-                if i == num_sims - 1:
-                    global_alarm_idx = start_idx + relative_first_idx
-                    last_run_data = {
-                        'ma_clean': ma_clean,
-                        'ma_sim': ma_sim,
-                        'start_idx': start_idx,
-                        'alarm_idx': global_alarm_idx,
-                        'lcl': lcl, 'ucl': ucl
+                # Lưu data vẽ
+                if day_name == days_to_run[-1]:
+                     plot_data = {
+                        'day': day_name,
+                        'vals_clean': vals,
+                        'ma_clean': ma_clean_full,
+                        'ma_sim': ma_biased,
+                        'inject_idx': injection_point,
+                        'alarm_idx': injection_point + first_alarm_idx_rel,
+                        'lcl': lcl, 'ucl': ucl,
+                        'status': 'Detected'
                     }
             else:
-                 # Nếu không tìm thấy, vẫn lưu data để debug (không có alarm_idx)
-                 if i == num_sims - 1:
-                    last_run_data = {
-                        'ma_clean': ma_clean,
-                        'ma_sim': ma_sim,
-                        'start_idx': start_idx,
+                # Missed
+                if day_name == days_to_run[-1]:
+                     plot_data = {
+                        'day': day_name,
+                        'vals_clean': vals,
+                        'ma_clean': ma_clean_full,
+                        'ma_sim': ma_biased,
+                        'inject_idx': injection_point,
                         'alarm_idx': None,
-                        'lcl': lcl, 'ucl': ucl
+                        'lcl': lcl, 'ucl': ucl,
+                        'status': 'Missed'
                     }
 
-        # Tổng hợp chỉ số
-        if len(detected_counts) > 0:
-            ped = len(detected_counts) / num_sims * 100
-            anped = np.mean(detected_counts)
-            mnped = np.median(detected_counts)
-            nped95 = np.percentile(detected_counts, 95)
-        else:
-            ped = 0
-            anped = mnped = nped95 = None
-
-        return {
-            "Real_FPR (%)": round(real_fpr * 100, 2),
-            "Detection (%)": round(ped, 1),
-            "ANPed": round(anped, 1) if anped else "N/A",
-            "MNPed": round(mnped, 1) if mnped else "N/A",
-            "95NPed": round(nped95, 1) if nped95 else "N/A"
-        }, last_run_data
+        # 4. Tổng hợp chỉ số
+        metrics = {
+            "Total Days": total_days,
+            "Detected (%)": round(detected_days / total_days * 100, 1) if total_days > 0 else 0,
+            "False Positive (%)": round(false_positive_days / total_days * 100, 1) if total_days > 0 else 0,
+            "ANPed": round(np.mean(nped_list), 1) if nped_list else "N/A",
+            "Median NPed": round(np.median(nped_list), 1) if nped_list else "N/A",
+            "95th NPed": round(np.percentile(nped_list, 95), 1) if nped_list else "N/A"
+        }
+        
+        return metrics, plot_data
 
 # =========================================================
-# 🚀 PHẦN 3: GIAO DIỆN STREAMLIT
+# 🖥️ PHẦN 3: GIAO DIỆN STREAMLIT
 # =========================================================
 
-st.set_page_config(layout="wide", page_title="PBRTQC High-Performance")
+st.set_page_config(layout="wide", page_title="PBRTQC Day-Simulator")
 
-st.title("⚡ PBRTQC Analyzer (High Performance Mode)")
-st.markdown("Hệ thống tối ưu hóa cho dữ liệu lớn (100k+ dòng).")
+st.title("📅 PBRTQC Day-by-Day Simulator")
+st.markdown("""
+Hệ thống mô phỏng theo logic **Daily Run**:
+1. Duyệt qua từng ngày trong dữ liệu Verify.
+2. Tại mỗi ngày, chọn ngẫu nhiên thời điểm (1-40) để thêm Bias.
+3. Nếu báo động xuất hiện **trước** khi thêm Bias -> **False Positive**.
+4. Nếu báo động xuất hiện **sau** khi thêm Bias -> **Detection**.
+""")
 
 with st.sidebar:
-    st.header("1. Upload & Cấu hình")
-    f_train = st.file_uploader("Dữ liệu Training", type='xlsx')
-    f_verify = st.file_uploader("Dữ liệu Verify", type='xlsx')
+    st.header("1. Upload Data")
+    f_train = st.file_uploader("Training Data (.xlsx)", type='xlsx')
+    f_verify = st.file_uploader("Verify Data (.xlsx)", type='xlsx')
     
     st.divider()
+    st.header("2. Settings")
     bias_pct = st.number_input("Bias (%)", value=5.0, step=0.5)
     target_fpr = st.slider("Target FPR (%)", 0.1, 10.0, 2.0, 0.1) / 100
-    model_type = st.selectbox("Mô hình", ["EWMA", "SMA"])
+    model = st.selectbox("Model", ["EWMA", "SMA"])
     
-    # Thêm tùy chọn giảm số lần mô phỏng nếu máy yếu
-    num_sims = st.slider("Số lần mô phỏng (Simulations)", 10, 100, 50, 10, help="Giảm xuống nếu thấy chạy chậm")
+    st.divider()
+    max_days = st.slider("Giới hạn số ngày chạy mô phỏng", 10, 5000, 500, help="Giảm số này nếu thấy chạy chậm")
 
 if f_train and f_verify:
-    # Đọc tên cột trước (Để không cache sai cột)
-    # Phần này đọc nhanh header thôi
-    df_preview = pd.read_excel(f_train, nrows=5)
-    col_res = st.selectbox("Chọn cột Kết quả:", df_preview.columns)
+    # Preview columns
+    df_temp = pd.read_excel(f_train, nrows=1)
+    all_cols = df_temp.columns.tolist()
     
-    # 1. LOAD DATA VỚI CACHE
-    with st.spinner("Đang tải và xử lý dữ liệu lớn..."):
-        data_train, data_verify = load_and_clean_data(f_train, f_verify, col_res)
-        
-    if data_train is not None:
-        st.info(f"Đã tải: Training ({len(data_train):,} dòng) - Verify ({len(data_verify):,} dòng)")
+    c1, c2 = st.columns(2)
+    col_res = c1.selectbox("Cột Kết quả (Results)", all_cols)
+    col_day = c2.selectbox("Cột Ngày (Days)", all_cols)
 
-        # 2. TÍNH TRUNCATION VỚI CACHE
-        trunc_range = find_optimal_truncation(data_train)
-        st.success(f"Truncation Range tối ưu: [{trunc_range[0]:.2f} - {trunc_range[1]:.2f}]")
-        
-        # 3. KHỞI TẠO ENGINE
-        engine = PBRTQCEngine(data_train, data_verify, trunc_range)
+    if st.button("🚀 Run Simulation"):
+        with st.spinner("Đang xử lý dữ liệu..."):
+            # 1. Load Data
+            df_train, df_verify = load_data(f_train, f_verify, col_res, col_day)
+            
+            if df_train is not None:
+                # 2. Truncation
+                trunc_range = find_optimal_truncation(df_train[col_res].values)
+                st.info(f"Đã tối ưu Truncation Limit trên bộ Training: [{trunc_range[0]:.2f} - {trunc_range[1]:.2f}]")
+                
+                # 3. Init Engine
+                engine = PBRTQCEngine(df_train, df_verify, col_res, col_day, trunc_range)
+                
+                # 4. Define Cases
+                cases = [
+                    {'bs': 20, 'freq': 1},
+                    {'bs': 40, 'freq': 1},
+                    {'bs': 60, 'freq': 1}
+                ]
+                
+                results = []
+                plots = []
+                
+                # 5. Run Loop
+                prog_bar = st.progress(0)
+                for i, case in enumerate(cases):
+                    # a. Limit
+                    lcl, ucl = engine.determine_limits(model, case['bs'], target_fpr)
+                    
+                    # b. Sim
+                    metrics, p_data = engine.run_day_simulation(
+                        model, case['bs'], lcl, ucl, bias_pct, num_sims=max_days
+                    )
+                    
+                    res_row = {
+                        "Case": f"N={case['bs']}",
+                        "LCL": round(lcl, 2), "UCL": round(ucl, 2),
+                        **metrics
+                    }
+                    results.append(res_row)
+                    plots.append({'name': f"Case N={case['bs']}", 'data': p_data})
+                    
+                    prog_bar.progress((i+1)/len(cases))
+                
+                # 6. Display
+                st.subheader("📊 Kết quả Đánh giá")
+                st.dataframe(pd.DataFrame(results).style.highlight_max(subset=['Detected (%)'], color='#d1ffbd'), use_container_width=True)
+                
+                st.divider()
+                st.subheader("📈 Chi tiết 1 Ngày ngẫu nhiên (Ngày cuối cùng trong mô phỏng)")
+                
+                tabs = st.tabs([p['name'] for p in plots])
+                for i, tab in enumerate(tabs):
+                    with tab:
+                        d = plots[i]['data']
+                        if d:
+                            fig, ax = plt.subplots(figsize=(12, 5))
+                            
+                            # Vẽ Clean MA
+                            ax.plot(d['ma_clean'], label='MA (Clean Run)', color='green', alpha=0.4)
+                            
+                            # Vẽ Biased MA (Chỉ vẽ nếu có)
+                            if d['ma_sim'] is not None:
+                                ax.plot(d['ma_sim'], label=f'MA (Bias {bias_pct}%)', color='orange')
+                            
+                            # Limits
+                            ax.axhline(d['ucl'], color='red', ls='--')
+                            ax.axhline(d['lcl'], color='red', ls='--')
+                            
+                            # Injection Line
+                            ax.axvline(d['inject_idx'], color='black', ls=':', label='Thời điểm thêm lỗi')
+                            
+                            # Alarm Point
+                            if d['alarm_idx'] is not None:
+                                marker_color = 'purple' if d['status'] == 'False Positive' else 'red'
+                                marker_shape = 'X' if d['status'] == 'False Positive' else '*'
+                                ax.scatter(d['alarm_idx'], d['ma_clean'][d['alarm_idx']] if d['ma_sim'] is None else d['ma_sim'][d['alarm_idx']], 
+                                           color=marker_color, s=150, zorder=5, marker=marker_shape, label=f'Alarm ({d["status"]})')
 
-        # 4. CẤU HÌNH CASES
-        st.header("Cấu hình Cases")
-        cols = st.columns(3)
-        cases = []
-        for i, col in enumerate(cols):
-            with col:
-                bs = st.number_input(f"Block Size Case {i+1}", value=20*(i+1))
-                freq = 1
-                if model_type == "SMA":
-                    freq = st.number_input(f"Freq Case {i+1}", value=1, min_value=1)
-                cases.append({'bs': bs, 'freq': freq})
+                            ax.set_title(f"Mô phỏng ngày: {d['day']} - Trạng thái: {d['status']}")
+                            ax.legend()
+                            st.pyplot(fig)
+                        else:
+                            st.warning("Chưa có dữ liệu vẽ.")
 
-        # 5. CHẠY SIMULATION
-        if st.button("🚀 CHẠY ĐÁNH GIÁ NGAY"):
-            st.divider()
-            results_table = []
-            plot_data_list = []
-            
-            progress_bar = st.progress(0)
-            status_text = st.empty()
-            
-            for idx, case in enumerate(cases):
-                status_text.text(f"Đang chạy Case {idx+1}/{len(cases)} với {len(data_verify):,} dòng dữ liệu...")
-                
-                # a. Tính Limit
-                lcl, ucl = engine.determine_control_limits(model_type, case['bs'], target_fpr)
-                
-                # b. Chạy Sim (Dùng hàm Vectorized mới)
-                metrics, plot_data = engine.run_simulation_vectorized(
-                    model_type, case['bs'], lcl, ucl, bias_pct, 
-                    frequency=case['freq'], num_sims=num_sims
-                )
-                
-                row = {
-                    "Case": f"Case {idx+1}",
-                    "N": case['bs'],
-                    "LCL": round(lcl, 2), "UCL": round(ucl, 2),
-                    **metrics
-                }
-                results_table.append(row)
-                plot_data_list.append({'name': f"Case {idx+1}", 'data': plot_data})
-                
-                progress_bar.progress((idx + 1) / len(cases))
-            
-            status_text.text("Hoàn tất!")
-            
-            # HIỂN THỊ KẾT QUẢ
-            st.subheader("📊 Kết quả")
-            st.dataframe(pd.DataFrame(results_table).style.highlight_max(subset=['Detection (%)'], color='#d1ffbd'), use_container_width=True)
-            
-            # VẼ BIỂU ĐỒ
-            st.divider()
-            st.subheader("📈 Biểu đồ minh họa")
-            tabs = st.tabs([p['name'] for p in plot_data_list])
-            
-            for i, tab in enumerate(tabs):
-                with tab:
-                    d = plot_data_list[i]['data']
-                    if d:
-                        fig, ax = plt.subplots(figsize=(12, 4))
-                        # Vẽ sample khoảng 1000 điểm quanh điểm lỗi để đỡ lag khi vẽ
-                        center = d['start_idx']
-                        # Vẽ rộng ra 200 điểm trước và 500 điểm sau lỗi
-                        s_plot = max(0, center - 200)
-                        e_plot = min(len(d['ma_clean']), center + 500)
-                        
-                        x_axis = range(s_plot, e_plot)
-                        
-                        ax.plot(x_axis, d['ma_clean'][s_plot:e_plot], color='green', alpha=0.3, label='Sạch')
-                        ax.plot(x_axis, d['ma_sim'][s_plot:e_plot], color='orange', label='Lỗi')
-                        ax.axhline(d['ucl'], color='red', ls='--'); ax.axhline(d['lcl'], color='red', ls='--')
-                        ax.axvline(d['start_idx'], color='black', ls=':', label='Bắt đầu lỗi')
-                        
-                        if d['alarm_idx'] and s_plot <= d['alarm_idx'] <= e_plot:
-                            ax.scatter(d['alarm_idx'], d['ma_sim'][d['alarm_idx']], color='red', s=100, marker='*', zorder=5)
-                        
-                        ax.legend()
-                        st.pyplot(fig)
-
-    else:
-        st.warning("Vui lòng tải file lên.")
+            else:
+                st.error("Lỗi định dạng file.")
