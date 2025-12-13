@@ -141,27 +141,37 @@ class PBRTQCEngine:
             start_idx, end_idx = self.day_indices[day_name]
             day_len = end_idx - start_idx
             
-            # Nếu ngày ngắn hơn Block Size thì không thể tính AON -> Bỏ qua
-            if day_len < block_size: continue
-                
-            total_days += 1
-            
-            # --- CHỌN ĐIỂM TIÊM LỖI ---
+            # --- LOGIC MỚI: LỌC NGÀY ---
+            # 1. Nếu là ngày đầu tiên của toàn bộ dữ liệu (start_idx = 0):
+            # Bắt buộc phải đủ Block Size để khởi tạo MA.
+            if start_idx == 0 and day_len < block_size:
+                continue
+
+            # 2. Xác định điểm tiêm lỗi (Injection Point)
             if fixed_inject_idx is not None:
-                local_inject = min(fixed_inject_idx, day_len - 1)
-                local_inject = max(1, local_inject)
+                local_inject = fixed_inject_idx
+                # Nếu ngày quá ngắn, không tới được điểm Fixed Injection -> Bỏ qua
+                if day_len <= local_inject:
+                    continue
             else:
-                max_rnd = min(40, day_len - 2)
+                # Random Logic: Tự động điều chỉnh theo độ dài ngày
+                # Đảm bảo còn ít nhất 1 mẫu sau điểm tiêm lỗi
+                if day_len < 3: continue # Quá ngắn để random
+                max_rnd = day_len - 2 
                 if max_rnd < 1: max_rnd = 1
                 local_inject = np.random.randint(1, max_rnd + 1)
             
+            # --- CHẠY MÔ PHỎNG NẾU ĐỦ ĐIỀU KIỆN ---
+            total_days += 1
             global_inject_idx = start_idx + local_inject
             
             # Cập nhật Data Export
             global_biased_export[global_inject_idx : end_idx] *= bias_factor
             injection_flags[global_inject_idx : end_idx] = 1
 
+            # ----------------------------------------------------
             # 1. CHECK FALSE POSITIVE (Vùng trước lỗi)
+            # ----------------------------------------------------
             clean_check_mask = np.zeros(len(self.global_vals), dtype=bool)
             clean_check_mask[start_idx : global_inject_idx] = True
             
@@ -177,14 +187,14 @@ class PBRTQCEngine:
                 if num_fp > 0:
                     continue # False Alarm Day -> Skip
 
+            # ----------------------------------------------------
             # 2. CHECK DETECTION (Vùng sau lỗi)
+            # ----------------------------------------------------
             temp_global_vals = self.global_vals.copy()
             temp_global_vals[global_inject_idx : end_idx] *= bias_factor
             
-            # Tính lại MA với Bias
             global_ma_biased = self.calculate_ma(temp_global_vals, method, block_size)
             
-            # Mask vùng bị lỗi
             biased_check_mask = np.zeros(len(self.global_vals), dtype=bool)
             biased_check_mask[global_inject_idx : end_idx] = True
             
@@ -196,19 +206,11 @@ class PBRTQCEngine:
                 
                 if np.any(alarms_post):
                     detected_days += 1
-                    
-                    # --- TÍNH NPed CHÍNH XÁC ---
-                    # Lấy tất cả index (toàn cục) thỏa mãn điều kiện report trong vùng lỗi
                     valid_indices = np.where(final_biased_mask)[0]
-                    
-                    # Lọc ra các index có Alarm
-                    # Lưu ý: alarms_post tương ứng với valid_indices
                     alarm_indices = valid_indices[alarms_post]
                     
                     if len(alarm_indices) > 0:
-                        first_alarm_idx = alarm_indices[0] # Index toàn cục của điểm báo động đầu tiên
-                        
-                        # Công thức: Alarm Index - Injection Index + 1
+                        first_alarm_idx = alarm_indices[0]
                         nped = first_alarm_idx - global_inject_idx + 1
                         nped_list.append(nped)
 
@@ -252,7 +254,9 @@ st.set_page_config(layout="wide", page_title="PBRTQC Simulator Pro")
 
 st.title("🏥 PBRTQC Simulator: Stride Logic")
 st.markdown("""
-**Hệ thống hỗ trợ tính toán PBRTQC**
+**Hệ thống tính toán:**
+- **Continuous Logic:** Ngày sau nối tiếp ngày trước.
+- **Filter Logic:** Chỉ loại bỏ ngày quá ngắn so với điểm tiêm lỗi. Ngày đầu tiên bắt buộc >= Block Size.
 """)
 
 with st.sidebar:
