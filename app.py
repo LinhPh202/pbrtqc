@@ -131,7 +131,7 @@ class PBRTQCEngine:
         raw_train = df_train[col_res].values
         self.train_clean = raw_train[(raw_train >= self.trunc_min) & (raw_train <= self.trunc_max)]
         
-        # Verify Data (Apply Truncation Limit immediately)
+        # Verify Data (Apply Truncation Limit immediately for initial clean data)
         self.df_verify_clean = df_verify[
             (df_verify[col_res] >= self.trunc_min) & 
             (df_verify[col_res] <= self.trunc_max)
@@ -159,12 +159,17 @@ class PBRTQCEngine:
         }
 
     def calculate_ma(self, values, method, block_size):
+        """
+        Tính MA có hỗ trợ xử lý NaN (dữ liệu bị loại bỏ).
+        """
         series = pd.Series(values)
         if method == 'SMA':
-            return series.rolling(window=int(block_size)).mean().values
+            # min_periods=1: Cho phép tính trung bình dù có NaN (bỏ qua NaN)
+            return series.rolling(window=int(block_size), min_periods=1).mean().values
         elif method == 'EWMA':
             lam = 2 / (int(block_size) + 1)
-            return series.ewm(alpha=lam, adjust=False).mean().values
+            # ignore_na=True: Bỏ qua NaN trong quá trình tính trọng số
+            return series.ewm(alpha=lam, adjust=False, ignore_na=True).mean().values
         return values
 
     def get_report_mask(self, total_length, block_size, frequency):
@@ -187,7 +192,7 @@ class PBRTQCEngine:
         upper = np.percentile(valid_ma_values, (1 - target_fpr/2)*100)
         return lower, upper
 
-    def run_simulation(self, method, block_size, frequency, lcl, ucl, bias_pct, direction='positive', fixed_inject_idx=None):
+    def run_simulation(self, method, block_size, frequency, lcl, ucl, bias_pct, direction='positive', fixed_inject_idx=None, apply_trunc_on_bias=False):
         total_days = 0
         detected_days = 0
         nped_list = []
@@ -197,31 +202,21 @@ class PBRTQCEngine:
         else:
             bias_factor = 1 - (bias_pct / 100.0)
         
-        # =======================================================
-        # 1. AUDIT & FPR Calculation (Trên TOÀN BỘ dữ liệu sạch)
-        # =======================================================
-        # Tính MA cho toàn bộ file Verify (giả sử chưa có lỗi)
+        # 1. BASELINE AUDIT
         global_ma_clean = self.calculate_ma(self.global_vals, method, block_size)
         global_report_mask = self.get_report_mask(len(self.global_vals), block_size, frequency)
         
-        # Lấy tất cả các điểm AON report sạch
         baseline_aon_vals = global_ma_clean[global_report_mask]
-        
-        # Audit: Tổng số điểm kiểm tra
         total_clean_checks = len(baseline_aon_vals)
-        
-        # Audit: Tổng số Alarm giả (Check 2 đầu vì đây là dữ liệu sạch)
         baseline_alarms = (baseline_aon_vals < lcl) | (baseline_aon_vals > ucl)
         total_false_alarms = np.sum(baseline_alarms)
         
-        # Tính FPR
         real_fpr_pct = 0.0
         if total_clean_checks > 0:
             real_fpr_pct = (total_false_alarms / total_clean_checks) * 100.0
 
-        # =======================================================
-        # 2. CHẠY MÔ PHỎNG TIÊM LỖI (Tính Detection)
-        # =======================================================
+        # 2. SIMULATION
+        # Bản sao dữ liệu để xuất Excel (sẽ chứa cả NaN nếu bị lọc)
         global_biased_export = self.global_vals.copy()
         injection_flags = np.zeros(len(self.global_vals), dtype=int)
 
@@ -231,11 +226,9 @@ class PBRTQCEngine:
             start_idx, end_idx = self.day_indices[day_name]
             day_len = end_idx - start_idx
             
-            # Logic: Ngày đầu phải đủ block, ngày sau chỉ cần đủ để chứa Injection Point
             if start_idx == 0 and day_len < block_size:
                 continue
 
-            # Xác định Injection Point
             if fixed_inject_idx is not None:
                 local_inject = fixed_inject_idx
                 if day_len <= local_inject: continue
@@ -248,27 +241,40 @@ class PBRTQCEngine:
             total_days += 1
             global_inject_idx = start_idx + local_inject
             
-            # Tiêm lỗi vào Data Export
-            global_biased_export[global_inject_idx : end_idx] *= bias_factor
+            # --- XỬ LÝ DỮ LIỆU SAU KHI BIAS (CÓ ÁP DỤNG TRUNCATION HAY KHÔNG) ---
+            
+            # 1. Tạo chunk dữ liệu bị lỗi
+            biased_chunk = self.global_vals[global_inject_idx : end_idx] * bias_factor
+            
+            # 2. Nếu user chọn "Áp dụng Truncation sau khi thêm Bias"
+            if apply_trunc_on_bias:
+                # Tìm các giá trị vượt ngưỡng Truncation
+                outlier_mask = (biased_chunk < self.trunc_min) | (biased_chunk > self.trunc_max)
+                # Gán NaN để loại bỏ khỏi tính toán MA
+                biased_chunk[outlier_mask] = np.nan
+            
+            # 3. Cập nhật vào mảng Export
+            global_biased_export[global_inject_idx : end_idx] = biased_chunk
             injection_flags[global_inject_idx : end_idx] = 1
 
-            # CHECK DETECTION (Chỉ xét vùng sau khi tiêm lỗi)
+            # 4. Tạo mảng temp để tính toán Detection (ghép dữ liệu sạch đầu ngày + dữ liệu lỗi cuối ngày)
             temp_global_vals = self.global_vals.copy()
-            temp_global_vals[global_inject_idx : end_idx] *= bias_factor
+            # Gán đoạn biased chunk (đã có thể chứa NaN) vào
+            temp_global_vals[global_inject_idx : end_idx] = biased_chunk
             
-            # Tính lại MA cục bộ (hoặc giả lập) cho detection
+            # Tính lại MA
             global_ma_biased_temp = self.calculate_ma(temp_global_vals, method, block_size)
             
-            # Mask vùng bị lỗi
             biased_check_mask = np.zeros(len(self.global_vals), dtype=bool)
             biased_check_mask[global_inject_idx : end_idx] = True
             
-            # Kết hợp với Report Mask
             final_biased_mask = biased_check_mask & global_report_mask
             check_vals_post = global_ma_biased_temp[final_biased_mask]
             
+            # Lọc bỏ NaN khỏi check_vals_post (vì NaN nghĩa là không report được)
+            # Tuy nhiên, np.nan so sánh > UCL sẽ ra False -> Không Alarm -> Đúng logic.
+            
             if len(check_vals_post) > 0:
-                # Detection check theo hướng (1 chiều)
                 if direction == 'positive':
                     alarms_post = (check_vals_post > ucl)
                 else:
@@ -294,16 +300,16 @@ class PBRTQCEngine:
         }
         
         # Export Data
-        global_ma_biased_export = self.calculate_ma(global_biased_export, method, block_size)
-        aon_results = np.full(len(global_ma_biased_export), np.nan)
-        aon_results[global_report_mask] = global_ma_biased_export[global_report_mask]
+        global_ma_biased_export_ma = self.calculate_ma(global_biased_export, method, block_size)
+        aon_results = np.full(len(global_ma_biased_export_ma), np.nan)
+        aon_results[global_report_mask] = global_ma_biased_export_ma[global_report_mask]
 
         export_data = pd.DataFrame({
             'Day': self.global_days,
             'Result_Original': self.global_vals,
-            'Result_Biased': global_biased_export,
+            'Result_Biased': global_biased_export, # Cột này có thể chứa NaN nếu bị lọc
             'Is_Injected': injection_flags,
-            f'{method}_Continuous': global_ma_biased_export,
+            f'{method}_Continuous': global_ma_biased_export_ma,
             'AON_Reported': aon_results,
             'LCL': lcl,
             'UCL': ucl
@@ -332,6 +338,11 @@ with st.sidebar:
     st.divider()
     st.header("2. Settings")
     bias_pct = st.number_input("Bias (%)", value=5.0, step=0.5, help="Giá trị % dùng để cộng (Pos) và trừ (Neg).")
+    
+    # [NEW] Checkbox Truncation on Biased Data
+    apply_bias_trunc = st.checkbox("Áp dụng Truncation sau khi thêm Bias", value=False, 
+                                   help="Nếu chọn: Các giá trị sau khi cộng Bias nếu vượt ra ngoài khoảng Truncation ban đầu sẽ bị loại bỏ (coi là NaN) và không tính vào MA.")
+    
     target_fpr = st.slider("Target FPR (%)", 0.0, 10.0, 2.0, 0.1) / 100
     model = st.selectbox("Model", ["EWMA", "SMA"])
     
@@ -421,7 +432,8 @@ if f_train and f_verify:
                         method=model, block_size=case['bs'], frequency=case['freq'],
                         lcl=lcl, ucl=ucl, bias_pct=bias_pct,
                         direction='positive',
-                        fixed_inject_idx=fixed_point
+                        fixed_inject_idx=fixed_point,
+                        apply_trunc_on_bias=apply_bias_trunc # <--- TRUYỀN THAM SỐ
                     )
                     
                     # 2. Chạy Negative Bias
@@ -429,7 +441,8 @@ if f_train and f_verify:
                         method=model, block_size=case['bs'], frequency=case['freq'],
                         lcl=lcl, ucl=ucl, bias_pct=bias_pct,
                         direction='negative',
-                        fixed_inject_idx=fixed_point
+                        fixed_inject_idx=fixed_point,
+                        apply_trunc_on_bias=apply_bias_trunc # <--- TRUYỀN THAM SỐ
                     )
                     
                     # Lưu kết quả
@@ -459,8 +472,6 @@ if f_train and f_verify:
                 st.subheader("📉 Kết quả: Negative Bias Check (Check < LCL)")
                 st.dataframe(pd.DataFrame(results_neg).style.highlight_max(subset=['Detected (%)'], color='#ffcccc'), use_container_width=True)
 
-                # --- (Đã lược bỏ bảng Audit thô) ---
-                
                 st.divider()
                 with st.expander("🔍 Xem Biểu đồ Positive Bias"):
                     for idx, fig in enumerate(chart_container_pos):
