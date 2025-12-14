@@ -231,21 +231,23 @@ class PBRTQCEngine:
                 if day_len <= local_inject: continue
             else:
                 if day_len < 3: continue
-                max_rnd = day_len - 2 
+                # [FIXED LOGIC]: Giới hạn Random tối đa là 40 (hoặc day_len - 2 nếu ngày quá ngắn)
+                max_possible = day_len - 2
+                max_limit_user = 40
+                max_rnd = min(max_limit_user, max_possible)
                 if max_rnd < 1: max_rnd = 1
                 local_inject = np.random.randint(1, max_rnd + 1)
             
             total_days += 1
             global_inject_idx = start_idx + local_inject
             
-            # --- TẠO DỮ LIỆU LỖI (BƯỚC 1: TIÊM HẾT NGÀY) ---
+            # --- TẠO DỮ LIỆU LỖI ---
             biased_chunk = self.global_vals[global_inject_idx : end_idx] * bias_factor
             
             if apply_trunc_on_bias:
                 outlier_mask = (biased_chunk < self.trunc_min) | (biased_chunk > self.trunc_max)
                 biased_chunk[outlier_mask] = np.nan
             
-            # Cập nhật tạm thời vào export (nếu Reality Mode kích hoạt thì sẽ sửa lại sau)
             global_biased_export[global_inject_idx : end_idx] = biased_chunk
             injection_flags[global_inject_idx : end_idx] = 1
 
@@ -273,22 +275,15 @@ class PBRTQCEngine:
                     alarm_indices = valid_indices[alarms_post]
                     
                     if len(alarm_indices) > 0:
-                        first_alarm_idx = alarm_indices[0] # Đây là Index TOÀN CỤC của điểm Alarm đầu tiên
+                        first_alarm_idx = alarm_indices[0] 
                         nped = first_alarm_idx - global_inject_idx + 1
                         nped_list.append(nped)
                         
-                        # --- LOGIC REALITY MODE (SỬA LỖI NGAY KHI PHÁT HIỆN) ---
+                        # --- LOGIC REALITY MODE ---
                         if sim_mode == 'Reality (Fix on Alarm)':
-                            # Logic:
-                            # 1. Từ điểm Alarm đầu tiên (first_alarm_idx), lỗi đã được phát hiện.
-                            # 2. Sau điểm đó (first_alarm_idx + 1) đến hết ngày, dữ liệu phải TRỞ VỀ BÌNH THƯỜNG (Sạch).
-                            # 3. Cần revert lại global_biased_export và injection_flags về trạng thái gốc.
-                            
                             revert_start = first_alarm_idx + 1
                             if revert_start < end_idx:
-                                # Revert data về gốc (Clean)
                                 global_biased_export[revert_start : end_idx] = self.global_vals[revert_start : end_idx]
-                                # Xóa cờ injection
                                 injection_flags[revert_start : end_idx] = 0
 
         metrics = {
@@ -300,7 +295,7 @@ class PBRTQCEngine:
             "95NPed": round(np.percentile(nped_list, 95), 1) if nped_list else "N/A"
         }
         
-        # Export Data (Tính lại MA lần cuối dựa trên global_biased_export đã được xử lý Reality)
+        # Export Data
         global_ma_biased_export_ma = self.calculate_ma(global_biased_export, method, block_size)
         aon_results = np.full(len(global_ma_biased_export_ma), np.nan)
         aon_results[global_report_mask] = global_ma_biased_export_ma[global_report_mask]
@@ -326,7 +321,9 @@ st.set_page_config(layout="wide", page_title="PBRTQC Simulator Pro")
 
 st.title("🏥 PBRTQC Simulator: Dual Bias Check & Visualization")
 st.markdown("""
-Hệ thống mô phỏng PBRTQC đa năng.
+Hệ thống mô phỏng 2 chiều + Biểu đồ trực quan:
+1.  **Positive Bias (+):** Cộng thêm Bias -> Check > UCL.
+2.  **Negative Bias (-):** Trừ đi Bias -> Check < LCL.
 """)
 
 with st.sidebar:
@@ -338,11 +335,9 @@ with st.sidebar:
     st.header("2. Settings")
     bias_pct = st.number_input("Bias (%)", value=5.0, step=0.5, help="Giá trị % dùng để cộng (Pos) và trừ (Neg).")
     
-    # Checkbox Truncation on Biased Data
     apply_bias_trunc = st.checkbox("Áp dụng Truncation sau khi thêm Bias", value=False, 
-                                   help="Nếu chọn: Giá trị bias vượt ngưỡng sẽ bị loại bỏ (NaN).")
+                                   help="Nếu chọn: Các giá trị sau khi cộng Bias nếu vượt ra ngoài khoảng Truncation ban đầu sẽ bị loại bỏ (coi là NaN) và không tính vào MA.")
     
-    # [NEW] Simulation Mode
     sim_mode = st.selectbox("Chế độ Mô phỏng (Simulation Mode)", 
                             ["Standard (Continuous Bias)", "Reality (Fix on Alarm)"],
                             help="Standard: Lỗi kéo dài hết ngày. Reality: Lỗi biến mất ngay sau khi có Alarm đầu tiên.")
@@ -439,7 +434,7 @@ if f_train and f_verify:
                         direction='positive',
                         fixed_inject_idx=fixed_point,
                         apply_trunc_on_bias=apply_bias_trunc,
-                        sim_mode=sim_mode # <--- TRUYỀN MODE
+                        sim_mode=sim_mode 
                     )
                     
                     # 2. Chạy Negative Bias
@@ -449,7 +444,7 @@ if f_train and f_verify:
                         direction='negative',
                         fixed_inject_idx=fixed_point,
                         apply_trunc_on_bias=apply_bias_trunc,
-                        sim_mode=sim_mode # <--- TRUYỀN MODE
+                        sim_mode=sim_mode 
                     )
                     
                     # Lưu kết quả
