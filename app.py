@@ -158,29 +158,38 @@ class PBRTQCEngine:
             "Truncation Range": f"[{self.trunc_min:.2f} - {self.trunc_max:.2f}]"
         }
 
-    def calculate_ma(self, values, method, block_size):
+    def calculate_ma(self, values, method, param):
         """
         Tính MA có hỗ trợ xử lý NaN (dữ liệu bị loại bỏ).
+        param: Là 'block_size' (nếu SMA) hoặc 'lambda' (nếu EWMA)
         """
         series = pd.Series(values)
         if method == 'SMA':
-            return series.rolling(window=int(block_size), min_periods=1).mean().values
+            # SMA dùng Block Size (N)
+            # min_periods=1: Cho phép tính trung bình dù có NaN (bỏ qua NaN)
+            return series.rolling(window=int(param), min_periods=1).mean().values
         elif method == 'EWMA':
-            lam = 2 / (int(block_size) + 1)
-            return series.ewm(alpha=lam, adjust=False, ignore_na=True).mean().values
+            # EWMA dùng Lambda trực tiếp
+            # ignore_na=True: Bỏ qua NaN trong quá trình tính trọng số
+            return series.ewm(alpha=param, adjust=False, ignore_na=True).mean().values
         return values
 
-    def get_report_mask(self, total_length, block_size, frequency):
+    def get_report_mask(self, total_length, start_offset, frequency):
+        """
+        Tạo mask xác định các điểm Report.
+        start_offset: Điểm bắt đầu report (SMA = N-1; EWMA = F-1)
+        """
         mask = np.zeros(total_length, dtype=bool)
-        start_idx = int(block_size) - 1
+        start_idx = int(start_offset)
         if start_idx < total_length:
             report_indices = np.arange(start_idx, total_length, int(frequency))
             mask[report_indices] = True
         return mask
 
-    def determine_limits(self, method, block_size, frequency, target_fpr):
-        ma_values = self.calculate_ma(self.train_clean, method, block_size)
-        mask = self.get_report_mask(len(ma_values), block_size, frequency)
+    def determine_limits(self, method, param, start_offset, frequency, target_fpr):
+        """Tính Limit"""
+        ma_values = self.calculate_ma(self.train_clean, method, param)
+        mask = self.get_report_mask(len(ma_values), start_offset, frequency)
         valid_ma_values = ma_values[mask]
         
         if len(valid_ma_values) == 0:
@@ -190,7 +199,11 @@ class PBRTQCEngine:
         upper = np.percentile(valid_ma_values, (1 - target_fpr/2)*100)
         return lower, upper
 
-    def run_simulation(self, method, block_size, frequency, lcl, ucl, bias_pct, direction='positive', fixed_inject_idx=None, apply_trunc_on_bias=False, sim_mode='Standard'):
+    def run_simulation(self, method, param, start_offset, frequency, lcl, ucl, bias_pct, direction='positive', fixed_inject_idx=None, apply_trunc_on_bias=False, sim_mode='Standard'):
+        """
+        param: N (SMA) hoặc Lambda (EWMA)
+        start_offset: Điểm bắt đầu report
+        """
         total_days = 0
         detected_days = 0
         nped_list = []
@@ -201,8 +214,8 @@ class PBRTQCEngine:
             bias_factor = 1 - (bias_pct / 100.0)
         
         # 1. BASELINE AUDIT
-        global_ma_clean = self.calculate_ma(self.global_vals, method, block_size)
-        global_report_mask = self.get_report_mask(len(self.global_vals), block_size, frequency)
+        global_ma_clean = self.calculate_ma(self.global_vals, method, param)
+        global_report_mask = self.get_report_mask(len(self.global_vals), start_offset, frequency)
         
         baseline_aon_vals = global_ma_clean[global_report_mask]
         total_clean_checks = len(baseline_aon_vals)
@@ -223,7 +236,10 @@ class PBRTQCEngine:
             start_idx, end_idx = self.day_indices[day_name]
             day_len = end_idx - start_idx
             
-            if start_idx == 0 and day_len < block_size:
+            # Kiểm tra độ dài ngày có đủ để report không
+            # Với SMA cần ít nhất N mẫu. Với EWMA cần ít nhất Frequency mẫu (để có 1 điểm report)
+            min_req = start_offset + 1
+            if start_idx == 0 and day_len < min_req:
                 continue
 
             if fixed_inject_idx is not None:
@@ -231,7 +247,6 @@ class PBRTQCEngine:
                 if day_len <= local_inject: continue
             else:
                 if day_len < 3: continue
-                # [FIXED LOGIC]: Giới hạn Random tối đa là 40 (hoặc day_len - 2 nếu ngày quá ngắn)
                 max_possible = day_len - 2
                 max_limit_user = 40
                 max_rnd = min(max_limit_user, max_possible)
@@ -255,7 +270,7 @@ class PBRTQCEngine:
             temp_global_vals = self.global_vals.copy()
             temp_global_vals[global_inject_idx : end_idx] = biased_chunk
             
-            global_ma_biased_temp = self.calculate_ma(temp_global_vals, method, block_size)
+            global_ma_biased_temp = self.calculate_ma(temp_global_vals, method, param)
             
             biased_check_mask = np.zeros(len(self.global_vals), dtype=bool)
             biased_check_mask[global_inject_idx : end_idx] = True
@@ -296,7 +311,7 @@ class PBRTQCEngine:
         }
         
         # Export Data
-        global_ma_biased_export_ma = self.calculate_ma(global_biased_export, method, block_size)
+        global_ma_biased_export_ma = self.calculate_ma(global_biased_export, method, param)
         aon_results = np.full(len(global_ma_biased_export_ma), np.nan)
         aon_results[global_report_mask] = global_ma_biased_export_ma[global_report_mask]
 
@@ -321,7 +336,9 @@ st.set_page_config(layout="wide", page_title="PBRTQC Simulator Pro")
 
 st.title("🏥 PBRTQC Simulator: Dual Bias Check & Visualization")
 st.markdown("""
-Hệ thống mô phỏng PBRTQC đa năng.
+Hệ thống mô phỏng 2 chiều + Biểu đồ trực quan:
+1.  **Positive Bias (+):** Cộng thêm Bias -> Check > UCL.
+2.  **Negative Bias (-):** Trừ đi Bias -> Check < LCL.
 """)
 
 with st.sidebar:
@@ -334,13 +351,15 @@ with st.sidebar:
     bias_pct = st.number_input("Bias (%)", value=5.0, step=0.5, help="Giá trị % dùng để cộng (Pos) và trừ (Neg).")
     
     apply_bias_trunc = st.checkbox("Áp dụng Truncation sau khi thêm Bias", value=False, 
-                                   help="Nếu chọn: Các giá trị sau khi cộng Bias nếu vượt ra ngoài khoảng Truncation ban đầu sẽ bị loại bỏ (coi là NaN) và không tính vào MA.")
+                                   help="Nếu chọn: Giá trị bias vượt ngưỡng sẽ bị loại bỏ (NaN).")
     
     sim_mode = st.selectbox("Chế độ Mô phỏng (Simulation Mode)", 
                             ["Standard (Continuous Bias)", "Reality (Fix on Alarm)"],
                             help="Standard: Lỗi kéo dài hết ngày. Reality: Lỗi biến mất ngay sau khi có Alarm đầu tiên.")
 
     target_fpr = st.slider("Target FPR (%)", 0.0, 10.0, 2.0, 0.1) / 100
+    
+    # [NEW] MODEL SELECTION CHANGE
     model = st.selectbox("Model", ["EWMA", "SMA"])
     
     st.subheader("Injection Mode")
@@ -372,25 +391,42 @@ if f_train and f_verify:
     st.divider()
     st.subheader(f"4. Cấu hình tham số cho {model}")
     
-    default_configs = []
-    if model == 'SMA':
-        default_configs = [(20, 2), (30, 3), (40, 4)]
-    else: # EWMA
-        default_configs = [(3, 3), (4, 4), (5, 5)]
-
     col_case1, col_case2, col_case3 = st.columns(3)
     cases_config = []
     
-    def create_case_input(col, idx, default_n, default_f):
-        with col:
-            st.markdown(f"**Case {idx}**")
-            bs = st.number_input(f"Block Size (N)", value=default_n, key=f"bs{idx}", min_value=2)
-            freq = st.number_input("Frequency (F)", value=default_f, key=f"freq{idx}", min_value=1)
-            return {'bs': bs, 'freq': freq}
+    # [NEW] UI LOGIC CHO SMA VÀ EWMA
+    if model == 'SMA':
+        # SMA: Dùng Block Size (N) và Frequency (F)
+        default_configs = [(20, 2), (30, 3), (40, 4)]
+        
+        def create_sma_input(col, idx, default_n, default_f):
+            with col:
+                st.markdown(f"**Case {idx}**")
+                bs = st.number_input(f"Block Size (N)", value=default_n, key=f"bs{idx}", min_value=2)
+                freq = st.number_input("Frequency (F)", value=default_f, key=f"freq{idx}", min_value=1)
+                # Với SMA, start offset là N - 1 (đợi đủ N mẫu)
+                return {'param': bs, 'freq': freq, 'start_offset': bs - 1, 'label': f"N={bs}, F={freq}"}
 
-    cases_config.append(create_case_input(col_case1, 1, default_configs[0][0], default_configs[0][1]))
-    cases_config.append(create_case_input(col_case2, 2, default_configs[1][0], default_configs[1][1]))
-    cases_config.append(create_case_input(col_case3, 3, default_configs[2][0], default_configs[2][1]))
+        cases_config.append(create_sma_input(col_case1, 1, default_configs[0][0], default_configs[0][1]))
+        cases_config.append(create_sma_input(col_case2, 2, default_configs[1][0], default_configs[1][1]))
+        cases_config.append(create_sma_input(col_case3, 3, default_configs[2][0], default_configs[2][1]))
+
+    else: # EWMA
+        # EWMA: Dùng Lambda và Frequency (F)
+        # Default Lambda = 0.4 như yêu cầu
+        default_configs = [(0.4, 20), (0.4, 40), (0.4, 50)] 
+        
+        def create_ewma_input(col, idx, default_lam, default_f):
+            with col:
+                st.markdown(f"**Case {idx}**")
+                lam = st.number_input(f"Lambda (λ)", value=default_lam, key=f"lam{idx}", min_value=0.01, max_value=1.0, step=0.01)
+                freq = st.number_input("Frequency (F)", value=default_f, key=f"freq{idx}", min_value=1)
+                # Với EWMA, start offset dựa vào F (F-1) để báo cáo tại cuối chu kỳ F đầu tiên
+                return {'param': lam, 'freq': freq, 'start_offset': freq - 1, 'label': f"λ={lam}, F={freq}"}
+
+        cases_config.append(create_ewma_input(col_case1, 1, default_configs[0][0], default_configs[0][1]))
+        cases_config.append(create_ewma_input(col_case2, 2, default_configs[1][0], default_configs[1][1]))
+        cases_config.append(create_ewma_input(col_case3, 3, default_configs[2][0], default_configs[2][1]))
 
     if st.button("🚀 Run Dual Simulation"):
         with st.spinner(f"Đang chạy mô phỏng ({sim_mode})..."):
@@ -423,11 +459,15 @@ if f_train and f_verify:
                 prog_bar = st.progress(0)
                 
                 for i, case in enumerate(cases_config):
-                    lcl, ucl = engine.determine_limits(model, case['bs'], case['freq'], target_fpr)
+                    # Gọi hàm với param và start_offset tương ứng
+                    lcl, ucl = engine.determine_limits(
+                        method=model, param=case['param'], start_offset=case['start_offset'], 
+                        frequency=case['freq'], target_fpr=target_fpr
+                    )
                     
                     # 1. Chạy Positive Bias
                     metrics_pos, df_pos, nped_list_pos = engine.run_simulation(
-                        method=model, block_size=case['bs'], frequency=case['freq'],
+                        method=model, param=case['param'], start_offset=case['start_offset'], frequency=case['freq'],
                         lcl=lcl, ucl=ucl, bias_pct=bias_pct,
                         direction='positive',
                         fixed_inject_idx=fixed_point,
@@ -437,7 +477,7 @@ if f_train and f_verify:
                     
                     # 2. Chạy Negative Bias
                     metrics_neg, df_neg, nped_list_neg = engine.run_simulation(
-                        method=model, block_size=case['bs'], frequency=case['freq'],
+                        method=model, param=case['param'], start_offset=case['start_offset'], frequency=case['freq'],
                         lcl=lcl, ucl=ucl, bias_pct=bias_pct,
                         direction='negative',
                         fixed_inject_idx=fixed_point,
@@ -446,25 +486,27 @@ if f_train and f_verify:
                     )
                     
                     # Lưu kết quả
-                    row_base = {"Case": f"N={case['bs']}, F={case['freq']}", "LCL": round(lcl, 2), "UCL": round(ucl, 2)}
+                    row_base = {"Case": case['label'], "LCL": round(lcl, 2), "UCL": round(ucl, 2)}
                     results_pos.append({**row_base, **metrics_pos})
                     
                     metrics_neg_clean = metrics_neg.copy()
                     metrics_neg_clean.pop("Real FPR (%)", None) 
                     results_neg.append({**row_base, **metrics_neg_clean})
                     
-                    case_key_pos = f"Pos_N{case['bs']}_F{case['freq']}"
-                    case_key_neg = f"Neg_N{case['bs']}_F{case['freq']}"
+                    # Tên Sheet an toàn (loại bỏ dấu = nếu có)
+                    safe_label = case['label'].replace("=", "").replace(", ", "_")
+                    case_key_pos = f"Pos_{safe_label}"
+                    case_key_neg = f"Neg_{safe_label}"
                     
                     excel_sheets[case_key_pos] = df_pos
                     excel_sheets[case_key_neg] = df_neg
                     all_nped_data[case_key_pos] = nped_list_pos
                     all_nped_data[case_key_neg] = nped_list_neg
                     
-                    fig_pos = draw_chart(df_pos, model, lcl, ucl, f"Case {i+1}: Positive Bias (N={case['bs']}, F={case['freq']})", 'positive')
+                    fig_pos = draw_chart(df_pos, model, lcl, ucl, f"Case {i+1}: Positive Bias ({case['label']})", 'positive')
                     chart_container_pos.append(fig_pos)
                     
-                    fig_neg = draw_chart(df_neg, model, lcl, ucl, f"Case {i+1}: Negative Bias (N={case['bs']}, F={case['freq']})", 'negative')
+                    fig_neg = draw_chart(df_neg, model, lcl, ucl, f"Case {i+1}: Negative Bias ({case['label']})", 'negative')
                     chart_container_neg.append(fig_neg)
 
                     prog_bar.progress((i+1)/len(cases_config))
@@ -504,4 +546,3 @@ if f_train and f_verify:
                 )
             else:
                 st.error("Lỗi dữ liệu.")
-
