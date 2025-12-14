@@ -216,7 +216,6 @@ class PBRTQCEngine:
             real_fpr_pct = (total_false_alarms / total_clean_checks) * 100.0
 
         # 2. SIMULATION
-        # Bản sao dữ liệu để xuất Excel (sẽ chứa cả NaN nếu bị lọc)
         global_biased_export = self.global_vals.copy()
         injection_flags = np.zeros(len(self.global_vals), dtype=int)
 
@@ -241,28 +240,19 @@ class PBRTQCEngine:
             total_days += 1
             global_inject_idx = start_idx + local_inject
             
-            # --- XỬ LÝ DỮ LIỆU SAU KHI BIAS (CÓ ÁP DỤNG TRUNCATION HAY KHÔNG) ---
-            
-            # 1. Tạo chunk dữ liệu bị lỗi
+            # --- XỬ LÝ DỮ LIỆU SAU KHI BIAS ---
             biased_chunk = self.global_vals[global_inject_idx : end_idx] * bias_factor
             
-            # 2. Nếu user chọn "Áp dụng Truncation sau khi thêm Bias"
             if apply_trunc_on_bias:
-                # Tìm các giá trị vượt ngưỡng Truncation
                 outlier_mask = (biased_chunk < self.trunc_min) | (biased_chunk > self.trunc_max)
-                # Gán NaN để loại bỏ khỏi tính toán MA
                 biased_chunk[outlier_mask] = np.nan
             
-            # 3. Cập nhật vào mảng Export
             global_biased_export[global_inject_idx : end_idx] = biased_chunk
             injection_flags[global_inject_idx : end_idx] = 1
 
-            # 4. Tạo mảng temp để tính toán Detection (ghép dữ liệu sạch đầu ngày + dữ liệu lỗi cuối ngày)
             temp_global_vals = self.global_vals.copy()
-            # Gán đoạn biased chunk (đã có thể chứa NaN) vào
             temp_global_vals[global_inject_idx : end_idx] = biased_chunk
             
-            # Tính lại MA
             global_ma_biased_temp = self.calculate_ma(temp_global_vals, method, block_size)
             
             biased_check_mask = np.zeros(len(self.global_vals), dtype=bool)
@@ -270,9 +260,6 @@ class PBRTQCEngine:
             
             final_biased_mask = biased_check_mask & global_report_mask
             check_vals_post = global_ma_biased_temp[final_biased_mask]
-            
-            # Lọc bỏ NaN khỏi check_vals_post (vì NaN nghĩa là không report được)
-            # Tuy nhiên, np.nan so sánh > UCL sẽ ra False -> Không Alarm -> Đúng logic.
             
             if len(check_vals_post) > 0:
                 if direction == 'positive':
@@ -307,7 +294,7 @@ class PBRTQCEngine:
         export_data = pd.DataFrame({
             'Day': self.global_days,
             'Result_Original': self.global_vals,
-            'Result_Biased': global_biased_export, # Cột này có thể chứa NaN nếu bị lọc
+            'Result_Biased': global_biased_export, 
             'Is_Injected': injection_flags,
             f'{method}_Continuous': global_ma_biased_export_ma,
             'AON_Reported': aon_results,
@@ -315,7 +302,8 @@ class PBRTQCEngine:
             'UCL': ucl
         })
         
-        return metrics, export_data
+        # [NEW] Trả về thêm nped_list để Audit
+        return metrics, export_data, nped_list
 
 # =========================================================
 # 🖥️ PHẦN 4: GIAO DIỆN STREAMLIT
@@ -339,7 +327,6 @@ with st.sidebar:
     st.header("2. Settings")
     bias_pct = st.number_input("Bias (%)", value=5.0, step=0.5, help="Giá trị % dùng để cộng (Pos) và trừ (Neg).")
     
-    # [NEW] Checkbox Truncation on Biased Data
     apply_bias_trunc = st.checkbox("Áp dụng Truncation sau khi thêm Bias", value=False, 
                                    help="Nếu chọn: Các giá trị sau khi cộng Bias nếu vượt ra ngoài khoảng Truncation ban đầu sẽ bị loại bỏ (coi là NaN) và không tính vào MA.")
     
@@ -421,6 +408,9 @@ if f_train and f_verify:
                 
                 chart_container_pos = []
                 chart_container_neg = []
+                
+                # [NEW] Biến lưu trữ NPed raw data
+                all_nped_data = {} 
 
                 prog_bar = st.progress(0)
                 
@@ -428,21 +418,21 @@ if f_train and f_verify:
                     lcl, ucl = engine.determine_limits(model, case['bs'], case['freq'], target_fpr)
                     
                     # 1. Chạy Positive Bias
-                    metrics_pos, df_pos = engine.run_simulation(
+                    metrics_pos, df_pos, nped_list_pos = engine.run_simulation(
                         method=model, block_size=case['bs'], frequency=case['freq'],
                         lcl=lcl, ucl=ucl, bias_pct=bias_pct,
                         direction='positive',
                         fixed_inject_idx=fixed_point,
-                        apply_trunc_on_bias=apply_bias_trunc # <--- TRUYỀN THAM SỐ
+                        apply_trunc_on_bias=apply_bias_trunc
                     )
                     
                     # 2. Chạy Negative Bias
-                    metrics_neg, df_neg = engine.run_simulation(
+                    metrics_neg, df_neg, nped_list_neg = engine.run_simulation(
                         method=model, block_size=case['bs'], frequency=case['freq'],
                         lcl=lcl, ucl=ucl, bias_pct=bias_pct,
                         direction='negative',
                         fixed_inject_idx=fixed_point,
-                        apply_trunc_on_bias=apply_bias_trunc # <--- TRUYỀN THAM SỐ
+                        apply_trunc_on_bias=apply_bias_trunc
                     )
                     
                     # Lưu kết quả
@@ -453,9 +443,17 @@ if f_train and f_verify:
                     metrics_neg_clean.pop("Real FPR (%)", None) 
                     results_neg.append({**row_base, **metrics_neg_clean})
                     
-                    excel_sheets[f"Pos_N{case['bs']}_F{case['freq']}"] = df_pos
-                    excel_sheets[f"Neg_N{case['bs']}_F{case['freq']}"] = df_neg
+                    # Lưu Excel & NPed Data
+                    case_key_pos = f"Pos_N{case['bs']}_F{case['freq']}"
+                    case_key_neg = f"Neg_N{case['bs']}_F{case['freq']}"
                     
+                    excel_sheets[case_key_pos] = df_pos
+                    excel_sheets[case_key_neg] = df_neg
+                    
+                    all_nped_data[case_key_pos] = nped_list_pos
+                    all_nped_data[case_key_neg] = nped_list_neg
+                    
+                    # Charts
                     fig_pos = draw_chart(df_pos, model, lcl, ucl, f"Case {i+1}: Positive Bias (N={case['bs']}, F={case['freq']})", 'positive')
                     chart_container_pos.append(fig_pos)
                     
@@ -486,9 +484,15 @@ if f_train and f_verify:
                 st.subheader("📥 Xuất dữ liệu")
                 output = io.BytesIO()
                 with pd.ExcelWriter(output, engine='openpyxl') as writer:
+                    # 1. Sheet dữ liệu mô phỏng
                     for sheet_name, df in excel_sheets.items():
                         df.to_excel(writer, sheet_name=sheet_name, index=False)
-                
+                    
+                    # 2. [NEW] Sheet Audit NPed Raw
+                    # Tạo DataFrame từ dict (pd.Series tự xử lý độ dài khác nhau bằng cách điền NaN)
+                    df_audit_nped = pd.DataFrame(dict([ (k,pd.Series(v)) for k,v in all_nped_data.items() ]))
+                    df_audit_nped.to_excel(writer, sheet_name="Audit_NPed_Raw", index=False)
+
                 st.download_button(
                     label="Tải xuống báo cáo chi tiết (.xlsx)",
                     data=output.getvalue(),
