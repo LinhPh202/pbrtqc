@@ -57,9 +57,6 @@ def find_optimal_truncation(data_array, max_cut_percent=0.10, steps=10):
 # =========================================================
 
 def draw_chart(df, method, lcl, ucl, title, direction='positive'):
-    """
-    Vẽ biểu đồ MA với các điểm Alarm.
-    """
     fig = go.Figure()
 
     # 1. Vẽ đường MA liên tục
@@ -92,29 +89,23 @@ def draw_chart(df, method, lcl, ucl, title, direction='positive'):
 
     # 3. Đánh dấu các điểm Alarm
     if direction == 'positive':
-        # Alarm khi vượt UCL
         alarm_points = df[(df['AON_Reported'] > ucl)]
-        if not alarm_points.empty:
-            fig.add_trace(go.Scatter(
-                x=alarm_points.index, 
-                y=alarm_points['AON_Reported'], 
-                mode='markers', 
-                name='Alarm (> UCL)',
-                marker=dict(color='red', size=8, symbol='circle')
-            ))
+        color = 'red'
+        label = 'Alarm (> UCL)'
     else:
-        # Alarm khi dưới LCL
         alarm_points = df[(df['AON_Reported'] < lcl)]
-        if not alarm_points.empty:
-            fig.add_trace(go.Scatter(
-                x=alarm_points.index, 
-                y=alarm_points['AON_Reported'], 
-                mode='markers', 
-                name='Alarm (< LCL)',
-                marker=dict(color='blue', size=8, symbol='circle')
-            ))
+        color = 'blue'
+        label = 'Alarm (< LCL)'
 
-    # 4. Tùy chỉnh giao diện
+    if not alarm_points.empty:
+        fig.add_trace(go.Scatter(
+            x=alarm_points.index, 
+            y=alarm_points['AON_Reported'], 
+            mode='markers', 
+            name=label,
+            marker=dict(color=color, size=8, symbol='circle')
+        ))
+
     fig.update_layout(
         title=dict(text=title, font=dict(size=18, color='#cc0000')),
         xaxis_title="Data Point (Index)",
@@ -124,7 +115,6 @@ def draw_chart(df, method, lcl, ucl, title, direction='positive'):
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
         plot_bgcolor='rgba(0,0,0,0.05)'
     )
-    
     return fig
 
 # =========================================================
@@ -137,11 +127,9 @@ class PBRTQCEngine:
         self.col_res = col_res
         self.col_day = col_day
         
-        # 1. Training Data
         raw_train = df_train[col_res].values
         self.train_clean = raw_train[(raw_train >= self.trunc_min) & (raw_train <= self.trunc_max)]
         
-        # 2. Verify Data
         self.df_verify_clean = df_verify[
             (df_verify[col_res] >= self.trunc_min) & 
             (df_verify[col_res] <= self.trunc_max)
@@ -150,7 +138,6 @@ class PBRTQCEngine:
         self.global_vals = self.df_verify_clean[col_res].values.astype(float)
         self.global_days = self.df_verify_clean[col_day].values
 
-        # Map index theo ngày
         self.day_indices = {}
         unique_days = self.df_verify_clean[col_day].unique()
         current_idx = 0
@@ -160,7 +147,6 @@ class PBRTQCEngine:
             current_idx += count
 
     def get_data_stats(self):
-        """Trả về thống kê cơ bản của dữ liệu sạch"""
         return {
             "Train Mean": np.mean(self.train_clean),
             "Train Median": np.median(self.train_clean),
@@ -170,7 +156,6 @@ class PBRTQCEngine:
         }
 
     def calculate_ma(self, values, method, block_size):
-        """Tính MA liên tục"""
         series = pd.Series(values)
         if method == 'SMA':
             return series.rolling(window=int(block_size)).mean().values
@@ -180,7 +165,6 @@ class PBRTQCEngine:
         return values
 
     def get_report_mask(self, total_length, block_size, frequency):
-        """Tạo mask xác định các điểm Report"""
         mask = np.zeros(total_length, dtype=bool)
         start_idx = int(block_size) - 1
         if start_idx < total_length:
@@ -189,7 +173,6 @@ class PBRTQCEngine:
         return mask
 
     def determine_limits(self, method, block_size, frequency, target_fpr):
-        """Tính Limit"""
         ma_values = self.calculate_ma(self.train_clean, method, block_size)
         mask = self.get_report_mask(len(ma_values), block_size, frequency)
         valid_ma_values = ma_values[mask]
@@ -202,9 +185,6 @@ class PBRTQCEngine:
         return lower, upper
 
     def run_simulation(self, method, block_size, frequency, lcl, ucl, bias_pct, direction='positive', fixed_inject_idx=None):
-        """
-        direction: 'positive' (Cộng Bias, check > UCL) hoặc 'negative' (Trừ Bias, check < LCL)
-        """
         total_days = 0
         detected_days = 0
         nped_list = []
@@ -212,17 +192,14 @@ class PBRTQCEngine:
         total_clean_checks = 0    
         total_false_alarms = 0    
 
-        # Xử lý Bias Factor dựa trên hướng
         if direction == 'positive':
             bias_factor = 1 + (bias_pct / 100.0)
-        else: # negative
+        else:
             bias_factor = 1 - (bias_pct / 100.0)
         
-        # 1. Tính Clean MA & Report Mask
         global_ma_clean = self.calculate_ma(self.global_vals, method, block_size)
         global_report_mask = self.get_report_mask(len(self.global_vals), block_size, frequency)
 
-        # 2. Chuẩn bị xuất Excel
         global_biased_export = self.global_vals.copy()
         injection_flags = np.zeros(len(self.global_vals), dtype=int)
 
@@ -232,11 +209,9 @@ class PBRTQCEngine:
             start_idx, end_idx = self.day_indices[day_name]
             day_len = end_idx - start_idx
             
-            # Logic lọc ngày
             if start_idx == 0 and day_len < block_size:
                 continue
 
-            # Xác định Injection Point
             if fixed_inject_idx is not None:
                 local_inject = fixed_inject_idx
                 if day_len <= local_inject: continue
@@ -246,17 +221,13 @@ class PBRTQCEngine:
                 if max_rnd < 1: max_rnd = 1
                 local_inject = np.random.randint(1, max_rnd + 1)
             
-            # Đủ điều kiện chạy
             total_days += 1
             global_inject_idx = start_idx + local_inject
             
-            # Export data update
             global_biased_export[global_inject_idx : end_idx] *= bias_factor
             injection_flags[global_inject_idx : end_idx] = 1
 
-            # ----------------------------------------------------
-            # 1. CHECK FALSE POSITIVE (Vùng trước lỗi)
-            # ----------------------------------------------------
+            # 1. CHECK FALSE POSITIVE
             clean_check_mask = np.zeros(len(self.global_vals), dtype=bool)
             clean_check_mask[start_idx : global_inject_idx] = True
             final_clean_mask = clean_check_mask & global_report_mask
@@ -264,33 +235,22 @@ class PBRTQCEngine:
             
             if len(check_vals) > 0:
                 total_clean_checks += len(check_vals)
-                
-                # --- LOGIC MỚI: FPR LUÔN CHECK 2 CHIỀU ---
-                # Vì là vùng sạch, vi phạm UCL hay LCL đều là báo động giả
                 alarms = (check_vals < lcl) | (check_vals > ucl)
-                
                 num_fp = np.sum(alarms)
                 total_false_alarms += num_fp
-                
-                # Tiếp tục chạy xuống Detection (không continue)
 
-            # ----------------------------------------------------
-            # 2. CHECK DETECTION (Vùng sau lỗi)
-            # ----------------------------------------------------
+            # 2. CHECK DETECTION
             temp_global_vals = self.global_vals.copy()
             temp_global_vals[global_inject_idx : end_idx] *= bias_factor
             
-            # Tính lại MA cho đoạn này để check Detection
             global_ma_biased_temp = self.calculate_ma(temp_global_vals, method, block_size)
             
             biased_check_mask = np.zeros(len(self.global_vals), dtype=bool)
             biased_check_mask[global_inject_idx : end_idx] = True
-            
             final_biased_mask = biased_check_mask & global_report_mask
             check_vals_post = global_ma_biased_temp[final_biased_mask]
             
             if len(check_vals_post) > 0:
-                # Check Detection thì vẫn theo hướng (Directional)
                 if direction == 'positive':
                     alarms_post = (check_vals_post > ucl)
                 else:
@@ -306,7 +266,6 @@ class PBRTQCEngine:
                         nped = first_alarm_idx - global_inject_idx + 1
                         nped_list.append(nped)
 
-        # --- TỔNG HỢP METRICS ---
         real_fpr_pct = 0.0
         if total_clean_checks > 0:
             real_fpr_pct = (total_false_alarms / total_clean_checks) * 100.0
@@ -315,14 +274,17 @@ class PBRTQCEngine:
             "Total Days": total_days,
             "Detected (%)": round(detected_days / total_days * 100, 1) if total_days > 0 else 0,
             "Real FPR (%)": round(real_fpr_pct, 2),
+            # --- [NEW] CÁC CỘT AUDIT SỐ LIỆU THÔ ---
+            "Detected_Count": detected_days,
+            "False_Alarm_Count": total_false_alarms,
+            "Clean_Check_Count": total_clean_checks,
+            # ----------------------------------------
             "ANPed": round(np.mean(nped_list), 1) if nped_list else "N/A",
             "MNPed": round(np.median(nped_list), 1) if nped_list else "N/A",
             "95NPed": round(np.percentile(nped_list, 95), 1) if nped_list else "N/A"
         }
         
-        # --- EXPORT DATA & PLOT PREPARATION ---
         global_ma_biased_export = self.calculate_ma(global_biased_export, method, block_size)
-        
         aon_results = np.full(len(global_ma_biased_export), np.nan)
         aon_results[global_report_mask] = global_ma_biased_export[global_report_mask]
 
@@ -347,7 +309,9 @@ st.set_page_config(layout="wide", page_title="PBRTQC Simulator Pro")
 
 st.title("🏥 PBRTQC Simulator: Dual Bias Check & Visualization")
 st.markdown("""
-Hệ thống mô phỏng 2 chiều + Biểu đồ trực quan
+Hệ thống mô phỏng 2 chiều + Biểu đồ trực quan:
+1.  **Positive Bias (+):** Cộng thêm Bias -> Check > UCL.
+2.  **Negative Bias (-):** Trừ đi Bias -> Check < LCL.
 """)
 
 with st.sidebar:
@@ -458,13 +422,12 @@ if f_train and f_verify:
                         fixed_inject_idx=fixed_point
                     )
                     
-                    # Lưu kết quả Positive
+                    # Lưu kết quả
                     row_base = {"Case": f"N={case['bs']}, F={case['freq']}", "LCL": round(lcl, 2), "UCL": round(ucl, 2)}
                     results_pos.append({**row_base, **metrics_pos})
                     
-                    # Lưu kết quả Negative (Xóa cột Real FPR)
                     metrics_neg_clean = metrics_neg.copy()
-                    metrics_neg_clean.pop("Real FPR (%)", None) # <--- XOÁ CỘT FPR
+                    metrics_neg_clean.pop("Real FPR (%)", None) 
                     results_neg.append({**row_base, **metrics_neg_clean})
                     
                     excel_sheets[f"Pos_N{case['bs']}_F{case['freq']}"] = df_pos
@@ -483,16 +446,34 @@ if f_train and f_verify:
                 st.subheader("📈 Kết quả: Positive Bias Check (Check > UCL)")
                 st.dataframe(pd.DataFrame(results_pos).style.highlight_max(subset=['Detected (%)'], color='#d1ffbd'), use_container_width=True)
                 
-                with st.expander("🔍 Xem Biểu đồ Positive Bias (Chi tiết từng Case)"):
-                    for idx, fig in enumerate(chart_container_pos):
-                        st.plotly_chart(fig, use_container_width=True)
-
-                st.divider()
-
                 st.subheader("📉 Kết quả: Negative Bias Check (Check < LCL)")
                 st.dataframe(pd.DataFrame(results_neg).style.highlight_max(subset=['Detected (%)'], color='#ffcccc'), use_container_width=True)
 
-                with st.expander("🔍 Xem Biểu đồ Negative Bias (Chi tiết từng Case)"):
+                # --- [NEW] BẢNG AUDIT SỐ LIỆU THÔ ---
+                st.divider()
+                st.subheader("🕵️ Audit Data (Số liệu thô)")
+                st.info("Khu vực này hiển thị các biến đếm gốc để kiểm tra tính chính xác của %.")
+                
+                # Tạo Dataframe Audit cho Pos
+                audit_cols = ['Case', 'Detected_Count', 'Total Days', 'False_Alarm_Count', 'Clean_Check_Count']
+                
+                c1, c2 = st.columns(2)
+                with c1:
+                    st.markdown("**Positive Bias Audit**")
+                    df_audit_pos = pd.DataFrame(results_pos)[audit_cols]
+                    st.dataframe(df_audit_pos, use_container_width=True)
+                
+                with c2:
+                    st.markdown("**Negative Bias Audit**")
+                    df_audit_neg = pd.DataFrame(results_neg)[audit_cols]
+                    st.dataframe(df_audit_neg, use_container_width=True)
+                # ------------------------------------
+
+                with st.expander("🔍 Xem Biểu đồ Positive Bias"):
+                    for idx, fig in enumerate(chart_container_pos):
+                        st.plotly_chart(fig, use_container_width=True)
+
+                with st.expander("🔍 Xem Biểu đồ Negative Bias"):
                     for idx, fig in enumerate(chart_container_neg):
                         st.plotly_chart(fig, use_container_width=True)
                 
