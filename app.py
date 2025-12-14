@@ -321,9 +321,7 @@ st.set_page_config(layout="wide", page_title="PBRTQC Simulator Pro")
 
 st.title("🏥 PBRTQC Simulator: Dual Bias Check & Visualization")
 st.markdown("""
-Hệ thống mô phỏng 2 chiều + Biểu đồ trực quan:
-1.  **Positive Bias (+):** Cộng thêm Bias -> Check > UCL.
-2.  **Negative Bias (-):** Trừ đi Bias -> Check < LCL.
+Hệ thống mô phỏng PBRTQC đa năng.
 """)
 
 with st.sidebar:
@@ -506,3 +504,4 @@ if f_train and f_verify:
                 )
             else:
                 st.error("Lỗi dữ liệu.")
+
