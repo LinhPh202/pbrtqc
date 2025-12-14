@@ -3,6 +3,7 @@ import pandas as pd
 import numpy as np
 import scipy.stats as stats
 import io
+import plotly.graph_objects as go  # <--- THƯ VIỆN VẼ BIỂU ĐỒ
 
 # =========================================================
 # 🛠️ PHẦN 1: XỬ LÝ DỮ LIỆU & CACHING
@@ -52,7 +53,85 @@ def find_optimal_truncation(data_array, max_cut_percent=0.10, steps=10):
     return best_range
 
 # =========================================================
-# 🧠 PHẦN 2: ENGINE MÔ PHỎNG (DUAL DIRECTION)
+# 📈 PHẦN 2: HÀM VẼ BIỂU ĐỒ (PLOTLY)
+# =========================================================
+
+def draw_chart(df, method, lcl, ucl, title, direction='positive'):
+    """
+    Vẽ biểu đồ MA với các điểm Alarm.
+    df: DataFrame chứa kết quả mô phỏng (cột Continuous MA và AON Reported)
+    """
+    fig = go.Figure()
+
+    # 1. Vẽ đường MA liên tục (Màu xanh nhạt để thấy xu hướng)
+    # Lấy cột Continuous (đã tính trong simulation)
+    ma_col_name = f'{method}_Continuous'
+    if ma_col_name in df.columns:
+        fig.add_trace(go.Scatter(
+            x=df.index, 
+            y=df[ma_col_name], 
+            mode='lines', 
+            name=f'{method} (Continuous)',
+            line=dict(color='lightblue', width=1.5)
+        ))
+
+    # 2. Vẽ đường giới hạn (UCL - Đỏ, LCL - Xanh đậm)
+    fig.add_trace(go.Scatter(
+        x=[df.index.min(), df.index.max()], 
+        y=[ucl, ucl], 
+        mode='lines', 
+        name='UCL', 
+        line=dict(color='red', width=2, dash='dash')
+    ))
+    
+    fig.add_trace(go.Scatter(
+        x=[df.index.min(), df.index.max()], 
+        y=[lcl, lcl], 
+        mode='lines', 
+        name='LCL', 
+        line=dict(color='blue', width=2, dash='dash')
+    ))
+
+    # 3. Đánh dấu các điểm Alarm (Dựa trên AON_Reported)
+    # Chỉ lấy các điểm có giá trị (không phải NaN) và vượt ngưỡng
+    if direction == 'positive':
+        # Alarm khi vượt UCL
+        alarm_points = df[(df['AON_Reported'] > ucl)]
+        if not alarm_points.empty:
+            fig.add_trace(go.Scatter(
+                x=alarm_points.index, 
+                y=alarm_points['AON_Reported'], 
+                mode='markers', 
+                name='Alarm (> UCL)',
+                marker=dict(color='red', size=8, symbol='circle')
+            ))
+    else:
+        # Alarm khi dưới LCL
+        alarm_points = df[(df['AON_Reported'] < lcl)]
+        if not alarm_points.empty:
+            fig.add_trace(go.Scatter(
+                x=alarm_points.index, 
+                y=alarm_points['AON_Reported'], 
+                mode='markers', 
+                name='Alarm (< LCL)',
+                marker=dict(color='blue', size=8, symbol='circle')
+            ))
+
+    # 4. Tùy chỉnh giao diện (Layout)
+    fig.update_layout(
+        title=dict(text=title, font=dict(size=18, color='#cc0000')),
+        xaxis_title="Data Point (Index)",
+        yaxis_title="Value",
+        height=500,
+        margin=dict(l=20, r=20, t=40, b=20),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+        plot_bgcolor='rgba(0,0,0,0.05)' # Nền hơi xám nhẹ cho dễ nhìn
+    )
+    
+    return fig
+
+# =========================================================
+# 🧠 PHẦN 3: ENGINE MÔ PHỎNG (DUAL DIRECTION)
 # =========================================================
 
 class PBRTQCEngine:
@@ -146,18 +225,17 @@ class PBRTQCEngine:
         global_ma_clean = self.calculate_ma(self.global_vals, method, block_size)
         global_report_mask = self.get_report_mask(len(self.global_vals), block_size, frequency)
 
-        # 2. Chuẩn bị xuất Excel
+        # 2. Chuẩn bị xuất Excel & Vẽ biểu đồ
         global_biased_export = self.global_vals.copy()
         injection_flags = np.zeros(len(self.global_vals), dtype=int)
 
         days_to_run = list(self.day_indices.keys())
-        # [THAY ĐỔI]: Bỏ giới hạn num_sims, chạy hết các ngày
 
         for day_name in days_to_run:
             start_idx, end_idx = self.day_indices[day_name]
             day_len = end_idx - start_idx
             
-            # Logic lọc ngày: Ngày đầu tiên phải đủ Block. Các ngày sau chỉ cần đủ để chứa Injection Point.
+            # Logic lọc ngày
             if start_idx == 0 and day_len < block_size:
                 continue
 
@@ -175,7 +253,7 @@ class PBRTQCEngine:
             total_days += 1
             global_inject_idx = start_idx + local_inject
             
-            # Export data update
+            # Export data update (Cộng bias vào dữ liệu gốc để lát tính MA Biased cho biểu đồ)
             global_biased_export[global_inject_idx : end_idx] *= bias_factor
             injection_flags[global_inject_idx : end_idx] = 1
 
@@ -192,14 +270,12 @@ class PBRTQCEngine:
                 
                 # Check 1 chiều tùy theo hướng
                 if direction == 'positive':
-                    alarms = (check_vals > ucl) # Chỉ check vượt trên
+                    alarms = (check_vals > ucl)
                 else:
-                    alarms = (check_vals < lcl) # Chỉ check vượt dưới
+                    alarms = (check_vals < lcl)
                 
                 num_fp = np.sum(alarms)
                 total_false_alarms += num_fp
-                
-                # Vẫn đếm FPR, nhưng vẫn chạy tiếp xuống phần Detection.
 
             # ----------------------------------------------------
             # 2. CHECK DETECTION (Vùng sau lỗi)
@@ -207,17 +283,23 @@ class PBRTQCEngine:
             temp_global_vals = self.global_vals.copy()
             temp_global_vals[global_inject_idx : end_idx] *= bias_factor
             
-            # Tính lại MA
-            global_ma_biased = self.calculate_ma(temp_global_vals, method, block_size)
+            # Tính lại MA cho đoạn này để check Detection (chỉ cần tính cục bộ hoặc giả lập)
+            # Lưu ý: Để tối ưu tốc độ, ở đây ta chỉ tính toán logic Detection.
+            # Còn việc vẽ biểu đồ toàn cục sẽ làm ở bước Export Data bên dưới.
+            
+            # Tái tạo MA biased toàn cục (cho vòng lặp này) là hơi nặng. 
+            # Nhưng do logic EWMA cần tính liên tục, ta sẽ dựa vào global_ma_biased_export ở cuối hàm.
+            # Ở đây ta dùng temp calculation cho Detection.
+            
+            global_ma_biased_temp = self.calculate_ma(temp_global_vals, method, block_size)
             
             biased_check_mask = np.zeros(len(self.global_vals), dtype=bool)
             biased_check_mask[global_inject_idx : end_idx] = True
             
             final_biased_mask = biased_check_mask & global_report_mask
-            check_vals_post = global_ma_biased[final_biased_mask]
+            check_vals_post = global_ma_biased_temp[final_biased_mask]
             
             if len(check_vals_post) > 0:
-                # Check 1 chiều tùy theo hướng
                 if direction == 'positive':
                     alarms_post = (check_vals_post > ucl)
                 else:
@@ -247,8 +329,11 @@ class PBRTQCEngine:
             "95NPed": round(np.percentile(nped_list, 95), 1) if nped_list else "N/A"
         }
         
-        # --- EXPORT DATA ---
+        # --- EXPORT DATA & PLOT PREPARATION ---
+        # Tính MA đầy đủ trên dữ liệu ĐÃ CỘNG BIAS (để vẽ biểu đồ hiển thị hiệu ứng bias)
         global_ma_biased_export = self.calculate_ma(global_biased_export, method, block_size)
+        
+        # Tạo cột AON Reported (chứa NaN ở những chỗ không report)
         aon_results = np.full(len(global_ma_biased_export), np.nan)
         aon_results[global_report_mask] = global_ma_biased_export[global_report_mask]
 
@@ -257,7 +342,7 @@ class PBRTQCEngine:
             'Result_Original': self.global_vals,
             'Result_Biased': global_biased_export,
             'Is_Injected': injection_flags,
-            f'{method}_Continuous': global_ma_clean,
+            f'{method}_Continuous': global_ma_biased_export, # Dùng đường Biased MA để vẽ biểu đồ
             'AON_Reported': aon_results,
             'LCL': lcl,
             'UCL': ucl
@@ -266,17 +351,16 @@ class PBRTQCEngine:
         return metrics, export_data
 
 # =========================================================
-# 🖥️ PHẦN 3: GIAO DIỆN STREAMLIT
+# 🖥️ PHẦN 4: GIAO DIỆN STREAMLIT
 # =========================================================
 
 st.set_page_config(layout="wide", page_title="PBRTQC Simulator Pro")
 
-st.title("🏥 PBRTQC Simulator: Dual Bias Check")
+st.title("🏥 PBRTQC Simulator: Dual Bias Check & Visualization")
 st.markdown("""
-Hệ thống mô phỏng 2 chiều:
-1.  **Positive Bias (+):** Cộng thêm Bias -> Kiểm tra xem có vượt **> UCL**.
-2.  **Negative Bias (-):** Trừ đi Bias -> Kiểm tra xem có vượt **< LCL**.
-*Lưu ý: FPR không dừng quy trình kiểm tra Detection. Hệ thống chạy trên toàn bộ dữ liệu ngày.*
+Hệ thống mô phỏng 2 chiều + Biểu đồ trực quan:
+1.  **Positive Bias (+):** Cộng thêm Bias -> Check > UCL.
+2.  **Negative Bias (-):** Trừ đi Bias -> Check < LCL.
 """)
 
 with st.sidebar:
@@ -287,10 +371,8 @@ with st.sidebar:
     st.divider()
     st.header("2. Settings")
     bias_pct = st.number_input("Bias (%)", value=5.0, step=0.5, help="Giá trị % dùng để cộng (Pos) và trừ (Neg).")
-    # [THAY ĐỔI]: Target FPR từ 0.0 đến 10.0
     target_fpr = st.slider("Target FPR (%)", 0.0, 10.0, 2.0, 0.1) / 100
     model = st.selectbox("Model", ["EWMA", "SMA"])
-    # [THAY ĐỔI]: Bỏ Max Simulation Days
     
     st.subheader("Injection Mode")
     inject_mode = st.radio("Chế độ thêm lỗi:", ["Ngẫu nhiên (Random 1-40)", "Cố định (Fixed Point)"])
@@ -321,7 +403,6 @@ if f_train and f_verify:
     st.divider()
     st.subheader(f"4. Cấu hình tham số cho {model}")
     
-    # [THAY ĐỔI]: Cấu hình mặc định dựa trên Model
     default_configs = []
     if model == 'SMA':
         default_configs = [(20, 2), (30, 3), (40, 4)]
@@ -343,7 +424,7 @@ if f_train and f_verify:
     cases_config.append(create_case_input(col_case3, 3, default_configs[2][0], default_configs[2][1]))
 
     if st.button("🚀 Run Dual Simulation"):
-        with st.spinner("Đang chạy mô phỏng 2 chiều trên toàn bộ dữ liệu..."):
+        with st.spinner("Đang chạy mô phỏng và vẽ biểu đồ..."):
             df_train, df_verify = load_data(f_train, f_verify, col_res, col_day)
             
             if df_train is not None:
@@ -358,7 +439,6 @@ if f_train and f_verify:
                 
                 engine = PBRTQCEngine(df_train, df_verify, col_res, col_day, trunc_range)
                 
-                # [THAY ĐỔI]: Hiển thị thống kê dữ liệu sau khi Truncation
                 st.subheader("📋 Thống kê Dữ liệu (Sau Truncation)")
                 stats_data = engine.get_data_stats()
                 st.dataframe(pd.DataFrame([stats_data]), use_container_width=True)
@@ -367,18 +447,21 @@ if f_train and f_verify:
                 results_neg = []
                 excel_sheets = {} 
                 
+                # Container cho biểu đồ
+                chart_container_pos = []
+                chart_container_neg = []
+
                 prog_bar = st.progress(0)
                 
-                # Chạy Loop cho từng Case
                 for i, case in enumerate(cases_config):
-                    # Tính Limit chung (FPR chia đều 2 đuôi)
+                    # Tính Limit
                     lcl, ucl = engine.determine_limits(model, case['bs'], case['freq'], target_fpr)
                     
                     # 1. Chạy Positive Bias
                     metrics_pos, df_pos = engine.run_simulation(
                         method=model, block_size=case['bs'], frequency=case['freq'],
                         lcl=lcl, ucl=ucl, bias_pct=bias_pct,
-                        direction='positive', # <--- Hướng dương
+                        direction='positive',
                         fixed_inject_idx=fixed_point
                     )
                     
@@ -386,7 +469,7 @@ if f_train and f_verify:
                     metrics_neg, df_neg = engine.run_simulation(
                         method=model, block_size=case['bs'], frequency=case['freq'],
                         lcl=lcl, ucl=ucl, bias_pct=bias_pct,
-                        direction='negative', # <--- Hướng âm
+                        direction='negative',
                         fixed_inject_idx=fixed_point
                     )
                     
@@ -395,24 +478,43 @@ if f_train and f_verify:
                     results_pos.append({**row_base, **metrics_pos})
                     results_neg.append({**row_base, **metrics_neg})
                     
-                    # Lưu Excel (Phân biệt sheet Pos và Neg)
                     excel_sheets[f"Pos_N{case['bs']}_F{case['freq']}"] = df_pos
                     excel_sheets[f"Neg_N{case['bs']}_F{case['freq']}"] = df_neg
                     
+                    # TẠO BIỂU ĐỒ (Lưu vào list để hiển thị sau)
+                    fig_pos = draw_chart(df_pos, model, lcl, ucl, f"Case {i+1}: Positive Bias (N={case['bs']}, F={case['freq']})", 'positive')
+                    chart_container_pos.append(fig_pos)
+                    
+                    fig_neg = draw_chart(df_neg, model, lcl, ucl, f"Case {i+1}: Negative Bias (N={case['bs']}, F={case['freq']})", 'negative')
+                    chart_container_neg.append(fig_neg)
+
                     prog_bar.progress((i+1)/len(cases_config))
                 
-                # --- HIỂN THỊ KẾT QUẢ ---
+                # --- HIỂN THỊ KẾT QUẢ & BIỂU ĐỒ ---
+                
+                # 1. POSITIVE RESULTS
                 st.subheader("📈 Kết quả: Positive Bias Check (Check > UCL)")
                 st.dataframe(pd.DataFrame(results_pos).style.highlight_max(subset=['Detected (%)'], color='#d1ffbd'), use_container_width=True)
+                
+                # Hiển thị biểu đồ Pos trong Expander
+                with st.expander("🔍 Xem Biểu đồ Positive Bias (Chi tiết từng Case)"):
+                    for idx, fig in enumerate(chart_container_pos):
+                        st.plotly_chart(fig, use_container_width=True)
 
                 st.divider()
 
+                # 2. NEGATIVE RESULTS
                 st.subheader("📉 Kết quả: Negative Bias Check (Check < LCL)")
                 st.dataframe(pd.DataFrame(results_neg).style.highlight_max(subset=['Detected (%)'], color='#ffcccc'), use_container_width=True)
+
+                # Hiển thị biểu đồ Neg trong Expander
+                with st.expander("🔍 Xem Biểu đồ Negative Bias (Chi tiết từng Case)"):
+                    for idx, fig in enumerate(chart_container_neg):
+                        st.plotly_chart(fig, use_container_width=True)
                 
                 # --- DOWNLOAD ---
                 st.divider()
-                st.subheader("📥 Xuất dữ liệu (Gồm cả Pos & Neg Sheets)")
+                st.subheader("📥 Xuất dữ liệu")
                 output = io.BytesIO()
                 with pd.ExcelWriter(output, engine='openpyxl') as writer:
                     for sheet_name, df in excel_sheets.items():
