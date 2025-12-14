@@ -288,9 +288,6 @@ class PBRTQCEngine:
             "Total Days": total_days,
             "Detected (%)": round(detected_days / total_days * 100, 1) if total_days > 0 else 0,
             "Real FPR (%)": round(real_fpr_pct, 2),
-            "Detected_Count": detected_days,
-            "False_Alarm_Count": total_false_alarms, # Global Count
-            "Clean_Check_Count": total_clean_checks, # Global Count
             "ANPed": round(np.mean(nped_list), 1) if nped_list else "N/A",
             "MNPed": round(np.median(nped_list), 1) if nped_list else "N/A",
             "95NPed": round(np.percentile(nped_list, 95), 1) if nped_list else "N/A"
@@ -462,24 +459,9 @@ if f_train and f_verify:
                 st.subheader("📉 Kết quả: Negative Bias Check (Check < LCL)")
                 st.dataframe(pd.DataFrame(results_neg).style.highlight_max(subset=['Detected (%)'], color='#ffcccc'), use_container_width=True)
 
-                # --- BẢNG AUDIT SỐ LIỆU THÔ ---
+                # --- (Đã lược bỏ bảng Audit thô) ---
+                
                 st.divider()
-                st.subheader("🕵️ Audit Data (Số liệu thô - Toàn bộ Dataset)")
-                st.info("FPR được tính trên toàn bộ dữ liệu sạch (Baseline). Detection được tính theo từng ngày.")
-                
-                audit_cols = ['Case', 'Detected_Count', 'Total Days', 'False_Alarm_Count', 'Clean_Check_Count']
-                
-                c1, c2 = st.columns(2)
-                with c1:
-                    st.markdown("**Positive Bias Audit**")
-                    df_audit_pos = pd.DataFrame(results_pos)[audit_cols]
-                    st.dataframe(df_audit_pos, use_container_width=True)
-                
-                with c2:
-                    st.markdown("**Negative Bias Audit**")
-                    df_audit_neg = pd.DataFrame(results_neg)[audit_cols]
-                    st.dataframe(df_audit_neg, use_container_width=True)
-                
                 with st.expander("🔍 Xem Biểu đồ Positive Bias"):
                     for idx, fig in enumerate(chart_container_pos):
                         st.plotly_chart(fig, use_container_width=True)
