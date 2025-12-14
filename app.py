@@ -164,11 +164,9 @@ class PBRTQCEngine:
         """
         series = pd.Series(values)
         if method == 'SMA':
-            # min_periods=1: Cho phép tính trung bình dù có NaN (bỏ qua NaN)
             return series.rolling(window=int(block_size), min_periods=1).mean().values
         elif method == 'EWMA':
             lam = 2 / (int(block_size) + 1)
-            # ignore_na=True: Bỏ qua NaN trong quá trình tính trọng số
             return series.ewm(alpha=lam, adjust=False, ignore_na=True).mean().values
         return values
 
@@ -192,7 +190,7 @@ class PBRTQCEngine:
         upper = np.percentile(valid_ma_values, (1 - target_fpr/2)*100)
         return lower, upper
 
-    def run_simulation(self, method, block_size, frequency, lcl, ucl, bias_pct, direction='positive', fixed_inject_idx=None, apply_trunc_on_bias=False):
+    def run_simulation(self, method, block_size, frequency, lcl, ucl, bias_pct, direction='positive', fixed_inject_idx=None, apply_trunc_on_bias=False, sim_mode='Standard'):
         total_days = 0
         detected_days = 0
         nped_list = []
@@ -240,16 +238,18 @@ class PBRTQCEngine:
             total_days += 1
             global_inject_idx = start_idx + local_inject
             
-            # --- XỬ LÝ DỮ LIỆU SAU KHI BIAS ---
+            # --- TẠO DỮ LIỆU LỖI (BƯỚC 1: TIÊM HẾT NGÀY) ---
             biased_chunk = self.global_vals[global_inject_idx : end_idx] * bias_factor
             
             if apply_trunc_on_bias:
                 outlier_mask = (biased_chunk < self.trunc_min) | (biased_chunk > self.trunc_max)
                 biased_chunk[outlier_mask] = np.nan
             
+            # Cập nhật tạm thời vào export (nếu Reality Mode kích hoạt thì sẽ sửa lại sau)
             global_biased_export[global_inject_idx : end_idx] = biased_chunk
             injection_flags[global_inject_idx : end_idx] = 1
 
+            # --- TÍNH TOÁN DETECTION ---
             temp_global_vals = self.global_vals.copy()
             temp_global_vals[global_inject_idx : end_idx] = biased_chunk
             
@@ -273,9 +273,23 @@ class PBRTQCEngine:
                     alarm_indices = valid_indices[alarms_post]
                     
                     if len(alarm_indices) > 0:
-                        first_alarm_idx = alarm_indices[0]
+                        first_alarm_idx = alarm_indices[0] # Đây là Index TOÀN CỤC của điểm Alarm đầu tiên
                         nped = first_alarm_idx - global_inject_idx + 1
                         nped_list.append(nped)
+                        
+                        # --- LOGIC REALITY MODE (SỬA LỖI NGAY KHI PHÁT HIỆN) ---
+                        if sim_mode == 'Reality (Fix on Alarm)':
+                            # Logic:
+                            # 1. Từ điểm Alarm đầu tiên (first_alarm_idx), lỗi đã được phát hiện.
+                            # 2. Sau điểm đó (first_alarm_idx + 1) đến hết ngày, dữ liệu phải TRỞ VỀ BÌNH THƯỜNG (Sạch).
+                            # 3. Cần revert lại global_biased_export và injection_flags về trạng thái gốc.
+                            
+                            revert_start = first_alarm_idx + 1
+                            if revert_start < end_idx:
+                                # Revert data về gốc (Clean)
+                                global_biased_export[revert_start : end_idx] = self.global_vals[revert_start : end_idx]
+                                # Xóa cờ injection
+                                injection_flags[revert_start : end_idx] = 0
 
         metrics = {
             "Total Days": total_days,
@@ -286,7 +300,7 @@ class PBRTQCEngine:
             "95NPed": round(np.percentile(nped_list, 95), 1) if nped_list else "N/A"
         }
         
-        # Export Data
+        # Export Data (Tính lại MA lần cuối dựa trên global_biased_export đã được xử lý Reality)
         global_ma_biased_export_ma = self.calculate_ma(global_biased_export, method, block_size)
         aon_results = np.full(len(global_ma_biased_export_ma), np.nan)
         aon_results[global_report_mask] = global_ma_biased_export_ma[global_report_mask]
@@ -302,7 +316,6 @@ class PBRTQCEngine:
             'UCL': ucl
         })
         
-        # [NEW] Trả về thêm nped_list để Audit
         return metrics, export_data, nped_list
 
 # =========================================================
@@ -313,9 +326,7 @@ st.set_page_config(layout="wide", page_title="PBRTQC Simulator Pro")
 
 st.title("🏥 PBRTQC Simulator: Dual Bias Check & Visualization")
 st.markdown("""
-Hệ thống mô phỏng 2 chiều + Biểu đồ trực quan:
-1.  **Positive Bias (+):** Cộng thêm Bias -> Check > UCL.
-2.  **Negative Bias (-):** Trừ đi Bias -> Check < LCL.
+Hệ thống mô phỏng PBRTQC đa năng.
 """)
 
 with st.sidebar:
@@ -327,9 +338,15 @@ with st.sidebar:
     st.header("2. Settings")
     bias_pct = st.number_input("Bias (%)", value=5.0, step=0.5, help="Giá trị % dùng để cộng (Pos) và trừ (Neg).")
     
+    # Checkbox Truncation on Biased Data
     apply_bias_trunc = st.checkbox("Áp dụng Truncation sau khi thêm Bias", value=False, 
-                                   help="Nếu chọn: Các giá trị sau khi cộng Bias nếu vượt ra ngoài khoảng Truncation ban đầu sẽ bị loại bỏ (coi là NaN) và không tính vào MA.")
+                                   help="Nếu chọn: Giá trị bias vượt ngưỡng sẽ bị loại bỏ (NaN).")
     
+    # [NEW] Simulation Mode
+    sim_mode = st.selectbox("Chế độ Mô phỏng (Simulation Mode)", 
+                            ["Standard (Continuous Bias)", "Reality (Fix on Alarm)"],
+                            help="Standard: Lỗi kéo dài hết ngày. Reality: Lỗi biến mất ngay sau khi có Alarm đầu tiên.")
+
     target_fpr = st.slider("Target FPR (%)", 0.0, 10.0, 2.0, 0.1) / 100
     model = st.selectbox("Model", ["EWMA", "SMA"])
     
@@ -383,7 +400,7 @@ if f_train and f_verify:
     cases_config.append(create_case_input(col_case3, 3, default_configs[2][0], default_configs[2][1]))
 
     if st.button("🚀 Run Dual Simulation"):
-        with st.spinner("Đang chạy mô phỏng và vẽ biểu đồ..."):
+        with st.spinner(f"Đang chạy mô phỏng ({sim_mode})..."):
             df_train, df_verify = load_data(f_train, f_verify, col_res, col_day)
             
             if df_train is not None:
@@ -408,8 +425,6 @@ if f_train and f_verify:
                 
                 chart_container_pos = []
                 chart_container_neg = []
-                
-                # [NEW] Biến lưu trữ NPed raw data
                 all_nped_data = {} 
 
                 prog_bar = st.progress(0)
@@ -423,7 +438,8 @@ if f_train and f_verify:
                         lcl=lcl, ucl=ucl, bias_pct=bias_pct,
                         direction='positive',
                         fixed_inject_idx=fixed_point,
-                        apply_trunc_on_bias=apply_bias_trunc
+                        apply_trunc_on_bias=apply_bias_trunc,
+                        sim_mode=sim_mode # <--- TRUYỀN MODE
                     )
                     
                     # 2. Chạy Negative Bias
@@ -432,7 +448,8 @@ if f_train and f_verify:
                         lcl=lcl, ucl=ucl, bias_pct=bias_pct,
                         direction='negative',
                         fixed_inject_idx=fixed_point,
-                        apply_trunc_on_bias=apply_bias_trunc
+                        apply_trunc_on_bias=apply_bias_trunc,
+                        sim_mode=sim_mode # <--- TRUYỀN MODE
                     )
                     
                     # Lưu kết quả
@@ -443,17 +460,14 @@ if f_train and f_verify:
                     metrics_neg_clean.pop("Real FPR (%)", None) 
                     results_neg.append({**row_base, **metrics_neg_clean})
                     
-                    # Lưu Excel & NPed Data
                     case_key_pos = f"Pos_N{case['bs']}_F{case['freq']}"
                     case_key_neg = f"Neg_N{case['bs']}_F{case['freq']}"
                     
                     excel_sheets[case_key_pos] = df_pos
                     excel_sheets[case_key_neg] = df_neg
-                    
                     all_nped_data[case_key_pos] = nped_list_pos
                     all_nped_data[case_key_neg] = nped_list_neg
                     
-                    # Charts
                     fig_pos = draw_chart(df_pos, model, lcl, ucl, f"Case {i+1}: Positive Bias (N={case['bs']}, F={case['freq']})", 'positive')
                     chart_container_pos.append(fig_pos)
                     
@@ -484,12 +498,8 @@ if f_train and f_verify:
                 st.subheader("📥 Xuất dữ liệu")
                 output = io.BytesIO()
                 with pd.ExcelWriter(output, engine='openpyxl') as writer:
-                    # 1. Sheet dữ liệu mô phỏng
                     for sheet_name, df in excel_sheets.items():
                         df.to_excel(writer, sheet_name=sheet_name, index=False)
-                    
-                    # 2. [NEW] Sheet Audit NPed Raw
-                    # Tạo DataFrame từ dict (pd.Series tự xử lý độ dài khác nhau bằng cách điền NaN)
                     df_audit_nped = pd.DataFrame(dict([ (k,pd.Series(v)) for k,v in all_nped_data.items() ]))
                     df_audit_nped.to_excel(writer, sheet_name="Audit_NPed_Raw", index=False)
 
