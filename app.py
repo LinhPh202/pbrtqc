@@ -117,6 +117,63 @@ def draw_chart(df, method, lcl, ucl, title, direction='positive'):
     )
     return fig
 
+def draw_power_curve(power_data, title):
+    """
+    Vẽ biểu đồ Power Curve: X = Bias %, Y = Detection %
+    """
+    fig = go.Figure()
+    
+    fig.add_trace(go.Scatter(
+        x=power_data['Bias'],
+        y=power_data['Detection'],
+        mode='lines+markers',
+        name='Detection Rate',
+        line=dict(color='firebrick', width=3),
+        marker=dict(size=8)
+    ))
+
+    fig.add_hline(y=50, line_dash="dot", annotation_text="50%", annotation_position="bottom right")
+    fig.add_hline(y=90, line_dash="dash", annotation_text="90%", annotation_position="bottom right")
+
+    fig.update_layout(
+        title=dict(text=title, font=dict(size=16, color='#003366')),
+        xaxis_title="Bias (%)",
+        yaxis_title="Probability of Detection (%)",
+        yaxis=dict(range=[-5, 105]),
+        height=400,
+        margin=dict(l=20, r=20, t=40, b=20),
+        plot_bgcolor='rgba(0,0,0,0.05)'
+    )
+    return fig
+
+def draw_mnped_curve(power_data, title):
+    """
+    Vẽ biểu đồ MNPed Curve: X = Bias %, Y = Median NPed
+    """
+    fig = go.Figure()
+    
+    # Lọc bỏ giá trị None để vẽ liền mạch
+    clean_data = power_data.dropna(subset=['MNPed'])
+    
+    fig.add_trace(go.Scatter(
+        x=clean_data['Bias'],
+        y=clean_data['MNPed'],
+        mode='lines+markers',
+        name='MNPed',
+        line=dict(color='darkorange', width=3),
+        marker=dict(size=8)
+    ))
+
+    fig.update_layout(
+        title=dict(text=title, font=dict(size=16, color='#ff6600')),
+        xaxis_title="Bias (%)",
+        yaxis_title="Median NPed (Samples)",
+        height=400,
+        margin=dict(l=20, r=20, t=40, b=20),
+        plot_bgcolor='rgba(0,0,0,0.05)'
+    )
+    return fig
+
 # =========================================================
 # 🧠 PHẦN 3: ENGINE MÔ PHỎNG (DUAL DIRECTION)
 # =========================================================
@@ -165,20 +222,12 @@ class PBRTQCEngine:
         """
         series = pd.Series(values)
         if method == 'SMA':
-            # SMA dùng Block Size (N)
-            # min_periods=1: Cho phép tính trung bình dù có NaN (bỏ qua NaN)
             return series.rolling(window=int(param), min_periods=1).mean().values
         elif method == 'EWMA':
-            # EWMA dùng Lambda trực tiếp
-            # ignore_na=True: Bỏ qua NaN trong quá trình tính trọng số
             return series.ewm(alpha=param, adjust=False, ignore_na=True).mean().values
         return values
 
     def get_report_mask(self, total_length, start_offset, frequency):
-        """
-        Tạo mask xác định các điểm Report.
-        start_offset: Điểm bắt đầu report (SMA = N-1; EWMA = F-1)
-        """
         mask = np.zeros(total_length, dtype=bool)
         start_idx = int(start_offset)
         if start_idx < total_length:
@@ -187,7 +236,6 @@ class PBRTQCEngine:
         return mask
 
     def determine_limits(self, method, param, start_offset, frequency, target_fpr):
-        """Tính Limit"""
         ma_values = self.calculate_ma(self.train_clean, method, param)
         mask = self.get_report_mask(len(ma_values), start_offset, frequency)
         valid_ma_values = ma_values[mask]
@@ -200,10 +248,6 @@ class PBRTQCEngine:
         return lower, upper
 
     def run_simulation(self, method, param, start_offset, frequency, lcl, ucl, bias_pct, direction='positive', fixed_inject_idx=None, apply_trunc_on_bias=False, sim_mode='Standard'):
-        """
-        param: N (SMA) hoặc Lambda (EWMA)
-        start_offset: Điểm bắt đầu report
-        """
         total_days = 0
         detected_days = 0
         nped_list = []
@@ -236,8 +280,6 @@ class PBRTQCEngine:
             start_idx, end_idx = self.day_indices[day_name]
             day_len = end_idx - start_idx
             
-            # Kiểm tra độ dài ngày có đủ để report không
-            # Với SMA cần ít nhất N mẫu. Với EWMA cần ít nhất Frequency mẫu (để có 1 điểm report)
             min_req = start_offset + 1
             if start_idx == 0 and day_len < min_req:
                 continue
@@ -334,6 +376,7 @@ class PBRTQCEngine:
 
 st.set_page_config(layout="wide", page_title="PBRTQC Simulator Pro")
 
+# --- [TITLE ĐƯỢC GIỮ NGUYÊN THEO YÊU CẦU] ---
 st.title("🏥 PBRTQC Simulator: Dual Bias Check & Visualization")
 st.markdown("""
 Hệ thống mô phỏng PBRTQC đa năng.
@@ -356,8 +399,6 @@ with st.sidebar:
                             help="Standard: Lỗi kéo dài hết ngày. Reality: Lỗi biến mất ngay sau khi có Alarm đầu tiên.")
 
     target_fpr = st.slider("Target FPR (%)", 0.0, 10.0, 2.0, 0.1) / 100
-    
-    # [NEW] MODEL SELECTION CHANGE
     model = st.selectbox("Model", ["EWMA", "SMA"])
     
     st.subheader("Injection Mode")
@@ -377,6 +418,12 @@ with st.sidebar:
         c_min, c_max = st.columns(2)
         manual_min = c_min.number_input("Min Value", value=0.0)
         manual_max = c_max.number_input("Max Value", value=100.0)
+    
+    # Power Curve Config
+    with st.expander("⚙️ Cấu hình nâng cao: Power Curve"):
+        run_power_curve = st.checkbox("Vẽ biểu đồ Power Curve", value=False, help="Vẽ đường cong xác suất phát hiện lỗi.")
+        st.info(f"💡 Power Curve sẽ chạy từ Bias 0% đến {bias_pct * 2}% (Gấp 2 lần Bias bạn chọn).")
+        pc_steps = st.slider("Số điểm vẽ (Steps)", 5, 20, 10, help="Số điểm trên biểu đồ. Càng nhiều càng mượt nhưng chạy càng lâu.")
 
 if f_train and f_verify:
     df_temp = pd.read_excel(f_train, nrows=1)
@@ -392,17 +439,13 @@ if f_train and f_verify:
     col_case1, col_case2, col_case3 = st.columns(3)
     cases_config = []
     
-    # [NEW] UI LOGIC CHO SMA VÀ EWMA
     if model == 'SMA':
-        # SMA: Dùng Block Size (N) và Frequency (F)
         default_configs = [(20, 2), (30, 3), (40, 4)]
-        
         def create_sma_input(col, idx, default_n, default_f):
             with col:
                 st.markdown(f"**Case {idx}**")
                 bs = st.number_input(f"Block Size (N)", value=default_n, key=f"bs{idx}", min_value=2)
                 freq = st.number_input("Frequency (F)", value=default_f, key=f"freq{idx}", min_value=1)
-                # Với SMA, start offset là N - 1 (đợi đủ N mẫu)
                 return {'param': bs, 'freq': freq, 'start_offset': bs - 1, 'label': f"N={bs}, F={freq}"}
 
         cases_config.append(create_sma_input(col_case1, 1, default_configs[0][0], default_configs[0][1]))
@@ -410,16 +453,12 @@ if f_train and f_verify:
         cases_config.append(create_sma_input(col_case3, 3, default_configs[2][0], default_configs[2][1]))
 
     else: # EWMA
-        # EWMA: Dùng Lambda và Frequency (F)
-        # Default Lambda = 0.4 như yêu cầu
         default_configs = [(0.4, 20), (0.4, 40), (0.4, 50)] 
-        
         def create_ewma_input(col, idx, default_lam, default_f):
             with col:
                 st.markdown(f"**Case {idx}**")
                 lam = st.number_input(f"Lambda (λ)", value=default_lam, key=f"lam{idx}", min_value=0.01, max_value=1.0, step=0.01)
                 freq = st.number_input("Frequency (F)", value=default_f, key=f"freq{idx}", min_value=1)
-                # Với EWMA, start offset dựa vào F (F-1) để báo cáo tại cuối chu kỳ F đầu tiên
                 return {'param': lam, 'freq': freq, 'start_offset': freq - 1, 'label': f"λ={lam}, F={freq}"}
 
         cases_config.append(create_ewma_input(col_case1, 1, default_configs[0][0], default_configs[0][1]))
@@ -453,11 +492,12 @@ if f_train and f_verify:
                 chart_container_pos = []
                 chart_container_neg = []
                 all_nped_data = {} 
+                power_curve_charts = [] 
 
                 prog_bar = st.progress(0)
                 
                 for i, case in enumerate(cases_config):
-                    # Gọi hàm với param và start_offset tương ứng
+                    # 0. Tính Limit
                     lcl, ucl = engine.determine_limits(
                         method=model, param=case['param'], start_offset=case['start_offset'], 
                         frequency=case['freq'], target_fpr=target_fpr
@@ -491,7 +531,6 @@ if f_train and f_verify:
                     metrics_neg_clean.pop("Real FPR (%)", None) 
                     results_neg.append({**row_base, **metrics_neg_clean})
                     
-                    # Tên Sheet an toàn (loại bỏ dấu = nếu có)
                     safe_label = case['label'].replace("=", "").replace(", ", "_")
                     case_key_pos = f"Pos_{safe_label}"
                     case_key_neg = f"Neg_{safe_label}"
@@ -506,6 +545,46 @@ if f_train and f_verify:
                     
                     fig_neg = draw_chart(df_neg, model, lcl, ucl, f"Case {i+1}: Negative Bias ({case['label']})", 'negative')
                     chart_container_neg.append(fig_neg)
+
+                    # ===================================================
+                    # LOGIC VẼ POWER CURVE (DETECTION + MNPed)
+                    # ===================================================
+                    if run_power_curve:
+                        st.toast(f"Đang tính Power Curve cho Case {i+1}...")
+                        max_pc_range = bias_pct * 2
+                        bias_points = np.linspace(0, max_pc_range, pc_steps)
+                        pc_results = []
+
+                        for b_val in bias_points:
+                            m_pc, _, _ = engine.run_simulation(
+                                method=model, param=case['param'], start_offset=case['start_offset'], frequency=case['freq'],
+                                lcl=lcl, ucl=ucl, bias_pct=b_val, 
+                                direction='positive', fixed_inject_idx=fixed_point, apply_trunc_on_bias=apply_bias_trunc, sim_mode=sim_mode
+                            )
+                            # Lưu cả Detection và MNPed
+                            # Nếu MNPed là string "N/A" thì chuyển về None để biểu đồ không bị lỗi
+                            mnped_val = m_pc['MNPed']
+                            if isinstance(mnped_val, str): mnped_val = None
+
+                            pc_results.append({
+                                'Bias': b_val, 
+                                'Detection': m_pc['Detected (%)'],
+                                'MNPed': mnped_val
+                            })
+                        
+                        df_pc = pd.DataFrame(pc_results)
+                        
+                        # Vẽ 2 biểu đồ
+                        fig_pc_det = draw_power_curve(df_pc, f"Detection: {case['label']}")
+                        fig_pc_mnped = draw_mnped_curve(df_pc, f"MNPed: {case['label']}")
+                        
+                        # Thêm vạch đánh dấu Bias mục tiêu
+                        fig_pc_det.add_vline(x=bias_pct, line_dash="dot", line_color="green")
+                        fig_pc_mnped.add_vline(x=bias_pct, line_dash="dot", line_color="green")
+                        
+                        # Lưu vào list để hiển thị sau (theo cặp)
+                        power_curve_charts.append((fig_pc_det, fig_pc_mnped))
+                        excel_sheets[f"PowerData_{safe_label}"] = df_pc
 
                     prog_bar.progress((i+1)/len(cases_config))
                 
@@ -525,6 +604,17 @@ if f_train and f_verify:
                 with st.expander("🔍 Xem Biểu đồ Negative Bias"):
                     for idx, fig in enumerate(chart_container_neg):
                         st.plotly_chart(fig, use_container_width=True)
+
+                # --- HIỂN THỊ POWER CURVE (NẾU CÓ) ---
+                if run_power_curve:
+                    st.divider()
+                    st.header("📊 Power Function Graphs (Detection & MNPed)")
+                    st.markdown("Biểu đồ thể hiện hiệu năng của thuật toán khi mức độ lỗi thay đổi.")
+                    
+                    for idx, (fig_det, fig_mnped) in enumerate(power_curve_charts):
+                        c1, c2 = st.columns(2)
+                        with c1: st.plotly_chart(fig_det, use_container_width=True)
+                        with c2: st.plotly_chart(fig_mnped, use_container_width=True)
                 
                 # --- DOWNLOAD ---
                 st.divider()
@@ -544,4 +634,3 @@ if f_train and f_verify:
                 )
             else:
                 st.error("Lỗi dữ liệu.")
-
