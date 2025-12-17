@@ -23,7 +23,7 @@ def load_data(file_train, file_verify, col_res, col_day):
         return None, None
 
 def find_optimal_truncation(data_array, max_cut_percent=0.10, steps=10):
-    """Tìm khoảng cắt tối ưu (Auto Mode)"""
+    """Tìm khoảng cắt tối ưu (Auto Mode - Asymmetric)"""
     calc_data = data_array
     if len(data_array) > 40000:
         np.random.seed(42)
@@ -41,8 +41,9 @@ def find_optimal_truncation(data_array, max_cut_percent=0.10, steps=10):
             if left_cut + right_cut >= 0.5: continue
             s = int(n * left_cut)
             e = int(n * (1 - right_cut))
-            subset = sorted_data[s:e]
+            if e <= s: continue
             
+            subset = sorted_data[s:e]
             if len(subset) > 20:
                 stat, p_val = stats.normaltest(subset)
                 if p_val > best_p:
@@ -60,56 +61,55 @@ def draw_chart(df, method, lcl, ucl, title, direction='positive'):
     """Vẽ biểu đồ kiểm soát vận hành (Control Chart)"""
     fig = go.Figure()
 
-    # Vẽ đường MA liên tục
+    # 1. Vẽ đường MA liên tục (Nối các điểm đứt quãng do drop outlier)
     ma_col_name = f'{method}_Bias_Continuous'
     if ma_col_name in df.columns:
-        # Lọc bỏ NaN để vẽ liền nét (hoặc để ngắt quãng tùy ý)
-        # Ở đây vẽ đè lên trục thời gian thực
         fig.add_trace(go.Scatter(
             x=df.index, 
             y=df[ma_col_name], 
             mode='lines', 
             name=f'{method} (Continuous)',
             line=dict(color='lightblue', width=1.5),
-            connectgaps=True # Nối các điểm lại dù có NaN ở giữa (do bị drop outlier)
+            connectgaps=True # Quan trọng: Nối liền các điểm bị NaN
         ))
 
-    # Vẽ đường giới hạn
+    # 2. Vẽ đường giới hạn
     fig.add_trace(go.Scatter(
         x=[df.index.min(), df.index.max()], 
         y=[ucl, ucl], 
-        mode='lines', 
-        name='UCL', 
+        mode='lines', name='UCL', 
         line=dict(color='red', width=2, dash='dash')
     ))
     
     fig.add_trace(go.Scatter(
         x=[df.index.min(), df.index.max()], 
         y=[lcl, lcl], 
-        mode='lines', 
-        name='LCL', 
+        mode='lines', name='LCL', 
         line=dict(color='blue', width=2, dash='dash')
     ))
 
-    # Đánh dấu các điểm Alarm
+    # 3. Đánh dấu các điểm Alarm
     alarm_points = pd.DataFrame()
-    if direction == 'positive':
-        alarm_points = df[(df['AON_Bias_Report'] > ucl)]
-        label = 'Alarm (> UCL)'
-        color = 'red'
-    elif direction == 'negative':
-        alarm_points = df[(df['AON_Bias_Report'] < lcl)]
-        label = 'Alarm (< LCL)'
-        color = 'blue'
+    col_report = 'AON_Bias_Report'
     
-    if not alarm_points.empty:
-        fig.add_trace(go.Scatter(
-            x=alarm_points.index, 
-            y=alarm_points['AON_Bias_Report'], 
-            mode='markers', 
-            name=label,
-            marker=dict(color=color, size=8, symbol='circle')
-        ))
+    if col_report in df.columns:
+        if direction == 'positive':
+            alarm_points = df[(df[col_report] > ucl)]
+            label = 'Alarm (> UCL)'
+            color = 'red'
+        elif direction == 'negative':
+            alarm_points = df[(df[col_report] < lcl)]
+            label = 'Alarm (< LCL)'
+            color = 'blue'
+    
+        if not alarm_points.empty:
+            fig.add_trace(go.Scatter(
+                x=alarm_points.index, 
+                y=alarm_points[col_report], 
+                mode='markers', 
+                name=label,
+                marker=dict(color=color, size=8, symbol='circle')
+            ))
 
     fig.update_layout(
         title=dict(text=title, font=dict(size=18, color='#cc0000')),
@@ -171,10 +171,9 @@ class PBRTQCEngine:
         self.col_day = col_day
         
         raw_train = df_train[col_res].values
-        # Training Clean: Loại bỏ hoàn toàn giá trị ngoài khoảng
+        # [STRICT] Training Clean: Loại bỏ hoàn toàn giá trị ngoài khoảng
         self.train_clean = raw_train[(raw_train >= self.trunc_min) & (raw_train <= self.trunc_max)]
         
-        # Verify: Giữ nguyên index gốc nhưng đánh dấu để xử lý
         self.df_verify_raw = df_verify.copy()
         self.global_vals = self.df_verify_raw[col_res].values.astype(float)
         self.global_days = self.df_verify_raw[col_day].values
@@ -188,21 +187,58 @@ class PBRTQCEngine:
             current_idx += count
 
     def get_data_stats(self):
+        # Stats tính trên dữ liệu hợp lệ
+        verify_valid = self.global_vals[(self.global_vals >= self.trunc_min) & (self.global_vals <= self.trunc_max)]
         return {
             "Train Mean": np.mean(self.train_clean),
             "Train Median": np.median(self.train_clean),
-            "Verify Mean": np.mean(self.global_vals[(self.global_vals >= self.trunc_min) & (self.global_vals <= self.trunc_max)]),
+            "Verify Mean": np.mean(verify_valid),
             "Truncation Range": f"[{self.trunc_min:.2f} - {self.trunc_max:.2f}]"
         }
 
     def calculate_ma_stream(self, values, method, param):
-        """Tính MA trên chuỗi đã lọc (không chứa NaN/Outlier)"""
+        """Tính MA trên chuỗi đã lọc (Reduced Stream - không chứa Outlier)"""
         series = pd.Series(values)
         if method == 'SMA':
             return series.rolling(window=int(param), min_periods=1).mean().values
         elif method == 'EWMA':
-            return series.ewm(alpha=param, adjust=False).mean().values # adjust=False mặc định
+            return series.ewm(alpha=param, adjust=False).mean().values
         return values
+
+    def _process_strict(self, raw_array, method, param, start_offset, frequency):
+        """
+        Core logic Strict Mode:
+        1. Drop Outlier.
+        2. Calculate MA.
+        3. Frequency counting on valid samples.
+        4. Map back to original indices.
+        """
+        # 1. Lọc Outlier
+        mask_valid = (raw_array >= self.trunc_min) & (raw_array <= self.trunc_max)
+        stream_vals = raw_array[mask_valid]
+        original_indices = np.where(mask_valid)[0] # Lưu vị trí gốc
+        
+        # 2. Tính MA trên dòng sạch
+        stream_ma = self.calculate_ma_stream(stream_vals, method, param)
+        
+        # 3. Tạo Report Mask trên dòng sạch (Chỉ đếm mẫu hợp lệ)
+        n_stream = len(stream_ma)
+        report_mask_stream = np.zeros(n_stream, dtype=bool)
+        s_idx = int(start_offset)
+        if s_idx < n_stream:
+            report_mask_stream[s_idx::int(frequency)] = True
+            
+        # 4. Map ngược về mảng gốc (Full Size)
+        # Continuous Array (Có giá trị tại mọi điểm Hợp lệ)
+        ma_continuous_full = np.full(len(raw_array), np.nan)
+        ma_continuous_full[original_indices] = stream_ma
+        
+        # Report Array (Chỉ có giá trị tại điểm Report Hợp lệ)
+        ma_report_full = np.full(len(raw_array), np.nan)
+        report_indices_original = original_indices[report_mask_stream]
+        ma_report_full[report_indices_original] = stream_ma[report_mask_stream]
+        
+        return ma_continuous_full, ma_report_full, report_indices_original
 
     def determine_limits(self, method, param, start_offset, frequency, target_fpr):
         # Tính Limit dựa trên Training Data đã clean (Reduced Stream)
@@ -228,41 +264,6 @@ class PBRTQCEngine:
         
         return lower, upper, train_mean, train_median
 
-    def _process_strict(self, raw_array, method, param, start_offset, frequency):
-        """
-        Hàm nội bộ: 
-        1. Lọc bỏ outlier khỏi raw_array.
-        2. Tính MA trên reduced array.
-        3. Map kết quả về kích thước ban đầu (với NaN tại chỗ bị loại hoặc không phải điểm report).
-        """
-        # 1. Lọc Outlier
-        mask_valid = (raw_array >= self.trunc_min) & (raw_array <= self.trunc_max)
-        stream_vals = raw_array[mask_valid]
-        original_indices = np.where(mask_valid)[0] # Map vị trí gốc
-        
-        # 2. Tính MA trên dòng sạch
-        stream_ma = self.calculate_ma_stream(stream_vals, method, param)
-        
-        # 3. Tạo Report Mask trên dòng sạch
-        n_stream = len(stream_ma)
-        report_mask_stream = np.zeros(n_stream, dtype=bool)
-        s_idx = int(start_offset)
-        if s_idx < n_stream:
-            report_mask_stream[s_idx::int(frequency)] = True
-            
-        # 4. Map ngược về mảng gốc (Full Size) để vẽ biểu đồ và audit
-        # Mảng Continuous (Có giá trị tại mọi điểm Hợp lệ)
-        ma_continuous_full = np.full(len(raw_array), np.nan)
-        ma_continuous_full[original_indices] = stream_ma
-        
-        # Mảng Report (Chỉ có giá trị tại điểm Report)
-        ma_report_full = np.full(len(raw_array), np.nan)
-        # Lấy index gốc của các điểm report
-        report_indices_original = original_indices[report_mask_stream]
-        ma_report_full[report_indices_original] = stream_ma[report_mask_stream]
-        
-        return ma_continuous_full, ma_report_full, report_indices_original
-
     def run_simulation(self, method, param, start_offset, frequency, lcl, ucl, bias_pct, direction='positive', fixed_inject_idx=None, apply_trunc_on_bias=False, sim_mode='Standard'):
         total_days = 0
         detected_days = 0
@@ -275,7 +276,7 @@ class PBRTQCEngine:
         else:
             bias_factor = 1 - (bias_pct / 100.0)
         
-        # 1. BASELINE AUDIT (Tính FPR trên dữ liệu sạch)
+        # 1. BASELINE AUDIT (Tính FPR trên dữ liệu Verify gốc - coi là sạch)
         # Sử dụng logic Strict: Lọc bỏ outlier trước khi tính
         ma_cont_clean, ma_rep_clean, report_idx_clean = self._process_strict(
             self.global_vals, method, param, start_offset, frequency
@@ -284,7 +285,6 @@ class PBRTQCEngine:
         # Tính FPR trên các điểm report có giá trị (không nan)
         valid_checks = ma_rep_clean[~np.isnan(ma_rep_clean)]
         total_clean_checks = len(valid_checks)
-        # FPR xét 2 chiều
         baseline_alarms = (valid_checks < lcl) | (valid_checks > ucl)
         total_false_alarms = np.sum(baseline_alarms)
         
@@ -293,19 +293,17 @@ class PBRTQCEngine:
             real_fpr_pct = (total_false_alarms / total_clean_checks) * 100.0
 
         # 2. SIMULATION
-        # Mảng để export (sẽ được cập nhật dần)
+        # Mảng để export (sẽ được cập nhật dần theo logic Reality)
         final_biased_vals = self.global_vals.copy()
         injection_flags = np.zeros(len(self.global_vals), dtype=int)
         
-        # Chạy từng ngày
         days_to_run = list(self.day_indices.keys())
 
         for day_name in days_to_run:
             start_idx, end_idx = self.day_indices[day_name]
             day_len = end_idx - start_idx
             
-            # Kiểm tra độ dài NGÀY GỐC (chưa lọc) để quyết định inject
-            # Logic: Inject vào mẫu thứ X của ngày.
+            # Logic inject point
             if fixed_inject_idx is not None:
                 local_inject = fixed_inject_idx
                 if day_len <= local_inject: continue
@@ -317,43 +315,32 @@ class PBRTQCEngine:
                 if max_rnd < 1: max_rnd = 1
                 local_inject = np.random.randint(1, max_rnd + 1)
             
-            # Điều kiện start_offset cho mẫu hợp lệ? 
-            # Simulator cũ check trên độ dài raw. Ta giữ nguyên để tương thích input.
+            # Start offset condition
             min_req = start_offset + 1
             if start_idx == 0 and day_len < min_req: continue
 
             total_days += 1
             global_inject_idx = start_idx + local_inject
             
-            # --- TẠO DỮ LIỆU LỖI CHO TOÀN BỘ DATASET ---
-            # Để tính MA chính xác (với history), ta cần tái tạo dòng dữ liệu:
-            # Đoạn trước ngày này: Giữ nguyên Clean.
-            # Đoạn trong ngày này (sau inject): Bị Bias.
-            # Đoạn sau ngày này: Giữ nguyên Clean (Logic Isolated Event của Simulator cũ).
-            
-            # Tuy nhiên, hàm _process_strict tính trên toàn bộ array.
-            # Để tối ưu, ta tạo 1 array "Temp Global" cho ngày này.
+            # --- TẠO DỮ LIỆU LỖI CHO NGÀY NÀY ---
+            # Logic: Trước ngày này -> Clean. Trong ngày này -> Biased. Sau ngày này -> Clean.
             temp_global_vals = self.global_vals.copy()
             
             # Inject Bias
             biased_chunk = temp_global_vals[global_inject_idx : end_idx] * bias_factor
             temp_global_vals[global_inject_idx : end_idx] = biased_chunk
             
-            # Cập nhật mảng export
+            # Update mảng export (Mặc định là Standard mode, nếu Reality sẽ revert sau)
             final_biased_vals[global_inject_idx : end_idx] = biased_chunk
             injection_flags[global_inject_idx : end_idx] = 1
             
-            # --- TÍNH TOÁN STRICT (Drop Outlier -> Calc MA -> Map back) ---
-            # Lưu ý: Apply Truncation xảy ra bên trong _process_strict
+            # --- TÍNH TOÁN STRICT ---
+            # 1. Drop Outlier toàn bộ dataset -> 2. Calc MA -> 3. Map back
             ma_cont_day, ma_rep_day, report_idx_day = self._process_strict(
                 temp_global_vals, method, param, start_offset, frequency
             )
             
-            # Kiểm tra Detection
-            # Chỉ quan tâm các điểm report nằm trong vùng bị bias của ngày hiện tại
-            # Vùng bias: [global_inject_idx, end_idx)
-            
-            # Lọc các index report nằm trong vùng này
+            # Chỉ xét các điểm report nằm trong vùng bias của ngày này
             relevant_report_indices = report_idx_day[
                 (report_idx_day >= global_inject_idx) & (report_idx_day < end_idx)
             ]
@@ -362,48 +349,46 @@ class PBRTQCEngine:
             first_alarm_idx = -1
             
             if len(relevant_report_indices) > 0:
-                # Lấy giá trị MA tại các điểm này
                 check_vals = ma_rep_day[relevant_report_indices]
                 
+                # [STRICT] One-sided Detection for Simulation
                 if direction == 'positive':
-                    alarms = (check_vals > ucl) # Chỉ xét 1 chiều cho Detection bias dương
+                    alarms = (check_vals > ucl) 
                 else:
                     alarms = (check_vals < lcl)
                 
                 if np.any(alarms):
                     detected = True
-                    # Tìm điểm alarm đầu tiên
                     first_alarm_idx = relevant_report_indices[np.argmax(alarms)]
             
             if detected:
                 detected_days += 1
                 
-                # Tính NPed:
-                # Cần đếm số mẫu HỢP LỆ từ điểm inject đến điểm alarm
-                # Lấy đoạn dữ liệu raw từ inject đến alarm
+                # Tính NPed: Số mẫu HỢP LỆ từ điểm inject đến điểm alarm
                 segment = temp_global_vals[global_inject_idx : first_alarm_idx + 1]
-                # Đếm số mẫu nằm trong truncation range (mẫu hợp lệ)
                 valid_count = np.sum((segment >= self.trunc_min) & (segment <= self.trunc_max))
-                # NPed = số mẫu hợp lệ đã trôi qua (bao gồm cả mẫu báo động)
-                nped = valid_count
-                nped_list.append(nped)
+                nped_list.append(valid_count)
                 
-                # --- REALITY MODE (Fix on Alarm) ---
+                # --- REALITY MODE ---
                 if sim_mode == 'Reality (Fix on Alarm)':
                     revert_start = first_alarm_idx + 1
                     if revert_start < end_idx:
-                        # 1. Fix: Revert data về gốc
+                        # Fix: Revert data
                         temp_global_vals[revert_start : end_idx] = self.global_vals[revert_start : end_idx]
                         final_biased_vals[revert_start : end_idx] = self.global_vals[revert_start : end_idx]
                         injection_flags[revert_start : end_idx] = 0
                         
-                        # 2. Re-calc Strict trên dữ liệu đã fix
-                        ma_cont_fixed, ma_rep_fixed, report_idx_fixed = self._process_strict(
+                        # Re-calc Strict trên dữ liệu đã fix để đếm Residual
+                        _, _, report_idx_fixed = self._process_strict(
+                            temp_global_vals, method, param, start_offset, frequency
+                        )
+                        # Re-calc MA values (vì _process_strict trả về full array nhưng ta cần value cụ thể)
+                        # Để tối ưu, ta gọi lại hàm lấy MA continuous
+                        ma_cont_fixed, ma_rep_fixed, _ = self._process_strict(
                             temp_global_vals, method, param, start_offset, frequency
                         )
                         
-                        # 3. Count Residuals
-                        # Chỉ đếm trong vùng sau khi fix của ngày hôm đó
+                        # Check Residuals (Sau khi fix)
                         check_indices = report_idx_fixed[
                             (report_idx_fixed >= revert_start) & (report_idx_fixed < end_idx)
                         ]
@@ -411,8 +396,8 @@ class PBRTQCEngine:
                         res_count = 0
                         for idx in check_indices:
                             val = ma_rep_fixed[idx]
-                            # Vẫn check alarm (2 chiều hay 1 chiều? Thường dư âm check cả 2 hoặc chiều cũ)
-                            # Để chặt chẽ check 2 chiều vì dư âm có thể dao động
+                            # Residual check thường xét 2 chiều (dao động) hoặc chiều lỗi cũ
+                            # Để chặt chẽ, check 2 chiều
                             is_alarm = (val < lcl) or (val > ucl)
                             if is_alarm:
                                 res_count += 1
@@ -425,11 +410,11 @@ class PBRTQCEngine:
                 "Day": day_name,
                 "Injection_Index": global_inject_idx,
                 "Detection_Index": first_alarm_idx if detected else "N/A",
-                "NPed": nped if detected else "N/A",
+                "NPed": nped_list[-1] if detected else "N/A",
                 "Residual_Alarms": residual_alarms_list[-1] if (detected and sim_mode == 'Reality (Fix on Alarm)') else "N/A"
             })
 
-        # Tổng hợp kết quả
+        # Metrics Summary
         avg_residual = "N/A"
         med_residual = "N/A"
         if sim_mode == 'Reality (Fix on Alarm)' and residual_alarms_list:
@@ -447,10 +432,9 @@ class PBRTQCEngine:
             "Med_Residual": med_residual
         }
         
-        # Tạo dữ liệu export cuối cùng (Dùng kết quả của lần chạy cuối hoặc recalculate all biased)
-        # Để hiển thị đúng biểu đồ "Continuous Bias", ta nên tính 1 lần trên full biased data (Standard Mode)
-        # Hoặc giữ nguyên logic từng ngày (nhưng sẽ tốn kém để merge).
-        # Đơn giản: Recalculate strict trên final_biased_vals
+        # Final Recalculate for Export/Visualization (Continuous Bias View)
+        # Nếu là Standard Mode, final_biased_vals đã chứa bias cả ngày.
+        # Nếu là Reality Mode, final_biased_vals đã được revert sau alarm.
         ma_cont_final, ma_rep_final, _ = self._process_strict(
             final_biased_vals, method, param, start_offset, frequency
         )
@@ -472,13 +456,11 @@ class PBRTQCEngine:
 # 🖥️ PHẦN 4: GIAO DIỆN STREAMLIT
 # =========================================================
 
-# (Phần giao diện giữ nguyên như cũ, không thay đổi logic)
 st.set_page_config(layout="wide", page_title="PBRTQC Simulator Pro")
 
 st.title("🏥 PBRTQC Simulator: Dual Bias Check & Visualization")
-st.markdown("Hệ thống mô phỏng PBRTQC (Logic Strict: Outliers excluded from Blocksize/Frequency).")
+st.markdown("Hệ thống mô phỏng PBRTQC (Logic Strict: Loại bỏ Outliers).")
 
-# ... (Copy phần sidebar và main loop từ code trước, không cần sửa đổi gì thêm vì class Engine đã update)
 with st.sidebar:
     st.header("1. Upload Data")
     f_train = st.file_uploader("Training Data (.xlsx)", type='xlsx')
@@ -488,10 +470,11 @@ with st.sidebar:
     st.header("2. Settings")
     bias_pct = st.number_input("Bias (%)", value=5.0, step=0.5)
     
+    # Checkbox này mặc định True và Disable vì Strict Mode luôn áp dụng
     apply_bias_trunc = st.checkbox("Áp dụng Truncation sau khi thêm Bias", value=True, disabled=True,
-                                   help="Mặc định True trong chế độ Strict Mode.")
+                                   help="Bắt buộc trong chế độ Strict Mode.")
     
-    sim_mode = st.selectbox("Chế độ Mô phỏng (Simulation Mode)", 
+    sim_mode = st.selectbox("Chế độ Mô phỏng", 
                             ["Standard (Continuous Bias)", "Reality (Fix on Alarm)"])
 
     model = st.selectbox("Model", ["EWMA", "SMA"])
@@ -584,8 +567,9 @@ if f_train and f_verify:
             df_train, df_verify = load_data(f_train, f_verify, col_res, col_day)
             
             if df_train is not None:
-                # Logic Truncation
+                # Truncation Logic
                 data_train_vals = df_train[col_res].dropna().values
+                trunc_range = (0, 0)
                 if trunc_mode == "Auto (Tự động)":
                     trunc_range = find_optimal_truncation(data_train_vals)
                 elif trunc_mode == "Manual (Thủ công)":
@@ -607,7 +591,7 @@ if f_train and f_verify:
                 prog_bar = st.progress(0)
                 
                 for i, case in enumerate(cases_config):
-                    # Limit
+                    # Limits
                     lcl_auto, ucl_auto, train_mean, train_median = engine.determine_limits(
                         method=model, param=case['param'], start_offset=case['start_offset'], 
                         frequency=case['freq'], target_fpr=target_fpr
@@ -615,26 +599,25 @@ if f_train and f_verify:
                     lcl = manual_lcl if cl_mode == "Manual (Thủ công)" else lcl_auto
                     ucl = manual_ucl if cl_mode == "Manual (Thủ công)" else ucl_auto
                     
-                    # Run Pos
+                    # Positive
                     m_pos, df_pos, nped_pos, audit_pos = engine.run_simulation(
                         method=model, param=case['param'], start_offset=case['start_offset'], frequency=case['freq'],
                         lcl=lcl, ucl=ucl, bias_pct=bias_pct, direction='positive',
                         fixed_inject_idx=fixed_point, apply_trunc_on_bias=True, sim_mode=sim_mode 
                     )
-                    # Run Neg
+                    # Negative
                     m_neg, df_neg, nped_neg, audit_neg = engine.run_simulation(
                         method=model, param=case['param'], start_offset=case['start_offset'], frequency=case['freq'],
                         lcl=lcl, ucl=ucl, bias_pct=bias_pct, direction='negative',
                         fixed_inject_idx=fixed_point, apply_trunc_on_bias=True, sim_mode=sim_mode 
                     )
                     
-                    # Store Results
                     row_base = {
                         "Case": case['label'], "LCL": round(lcl, 2), "UCL": round(ucl, 2),
                         "Train_Mean": round(train_mean, 2), "Train_Median": round(train_median, 2)
                     }
                     results_pos.append({**row_base, **m_pos})
-                    results_neg.append({**row_base, **m_neg}) # Neg cũng có Real FPR
+                    results_neg.append({**row_base, **m_neg})
                     
                     safe_label = case['label'].replace("=", "").replace(", ", "_")
                     excel_sheets[f"Pos_{safe_label}"] = df_pos
@@ -689,6 +672,7 @@ if f_train and f_verify:
 
     if st.session_state.sim_results is not None:
         data = st.session_state.sim_results
+        
         st.subheader("📋 Thống kê Dữ liệu")
         st.info(f"Truncation Range: [{data['trunc_range'][0]:.2f} - {data['trunc_range'][1]:.2f}]")
         st.dataframe(pd.DataFrame([data['stats']]), use_container_width=True)
@@ -708,16 +692,16 @@ if f_train and f_verify:
 
         if run_power_curve and data['pc_datasets']:
             st.divider()
-            st.header("📊 Power Function Graphs")
+            st.header("📊 Combined Power Function Graphs")
             c1, c2, c3 = st.columns(3)
             with c1:
                 fig_det = draw_combined_curve(data['pc_datasets'], 'Detection', "Detection Rate (%)", "Detection (%)")
                 st.plotly_chart(fig_det, use_container_width=True)
             with c2:
-                fig_mnped = draw_combined_curve(data['pc_datasets'], 'MNPed', "Median NPed", "MNPed", is_log=True)
+                fig_mnped = draw_combined_curve(data['pc_datasets'], 'MNPed', "Median NPed (Speed)", "MNPed", is_log=True)
                 st.plotly_chart(fig_mnped, use_container_width=True)
             with c3:
-                fig_anped = draw_combined_curve(data['pc_datasets'], 'ANPed', "Average NPed", "ANPed", is_log=True)
+                fig_anped = draw_combined_curve(data['pc_datasets'], 'ANPed', "Average NPed (Speed)", "ANPed", is_log=True)
                 st.plotly_chart(fig_anped, use_container_width=True)
         
         st.divider()
@@ -726,6 +710,7 @@ if f_train and f_verify:
         with pd.ExcelWriter(output, engine='openpyxl') as writer:
             for sheet_name, df in data['excel_sheets'].items():
                 df.to_excel(writer, sheet_name=sheet_name, index=False)
+            
             df_audit_nped = pd.DataFrame(dict([(k,pd.Series(v)) for k,v in data['nped_data'].items()]))
             df_audit_nped.to_excel(writer, sheet_name="Audit_NPed_Raw", index=False)
             
@@ -736,8 +721,8 @@ if f_train and f_verify:
                 pd.DataFrame(all_audit_logs).to_excel(writer, sheet_name="Audit_Residual_Details", index=False)
 
         st.download_button(
-            label="Download Report (.xlsx)",
+            label="Tải xuống báo cáo chi tiết (.xlsx)",
             data=output.getvalue(),
-            file_name="PBRTQC_Simulation_Strict.xlsx",
+            file_name="PBRTQC_Dual_Simulation.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         )
